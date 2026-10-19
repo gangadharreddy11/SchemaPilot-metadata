@@ -100,7 +100,45 @@ Open your browser at **http://localhost:5173** to view the SchemaPilot dashboard
 
 ---
 
+## 4. Deploying to Vercel & Connecting Your Local Backend
+
+When you deploy your frontend to **Vercel** (`https://your-app.vercel.app`), web browsers strictly block insecure `http://` calls to `localhost:8000` due to **HTTPS Mixed Content security policies**.
+
+To connect your Vercel-deployed frontend to a backend running locally on your computer:
+
+### Step 1: Ensure Backend is Running with CORS Allowed
+Make sure `backend/.env` has:
+```env
+CORS_ORIGINS=*
+```
+Start your backend:
+```powershell
+python -m uvicorn app.main:app --reload --port 8000
+```
+
+### Step 2: Create a Free HTTPS Tunnel
+In a new terminal window, expose your port 8000 over HTTPS:
+
+**Option A (Zero install, no signup needed):**
+```bash
+npx localtunnel --port 8000
+```
+*Gives you an HTTPS link like: `https://xxxx.loca.lt`*
+
+**Option B (Ngrok):**
+```bash
+ngrok http 8000
+```
+*Gives you an HTTPS link like: `https://xxxx.ngrok-free.app`*
+
+### Step 3: Connect in the Frontend
+- **From within the UI**: Open your Vercel website, click the **"API: ..."** button in the top navigation bar, paste your tunnel HTTPS URL, and click **Save & Apply Connection**!
+- **OR via Vercel Environment Variables**: Go to Vercel Dashboard → Project Settings → **Environment Variables**, add `VITE_API_BASE_URL=https://your-tunnel-url`, and redeploy.
+
+---
+
 ## Security Notes
 - Passwords and credentials are never returned by the API or exposed in error messages.
 - The backend enforces read-only operations; table names are validated against database metadata before querying.
 - Keep `.env` files untracked in `.gitignore`.
+

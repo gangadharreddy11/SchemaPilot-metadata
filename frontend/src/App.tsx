@@ -1,14 +1,18 @@
 import { useEffect, useMemo, useState } from 'react'
 import {
   Activity,
+  AlertTriangle,
   Boxes,
+  Check,
   CheckCircle2,
   ChevronRight,
   CircleHelp,
+  Copy,
   Database,
   Download,
   ExternalLink,
   GitBranch,
+  Globe,
   KeyRound,
   LayoutDashboard,
   Menu,
@@ -16,13 +20,14 @@ import {
   RefreshCw,
   Search,
   Server,
+  Settings,
   ShieldCheck,
   Table2,
   Trash2,
   X
 } from 'lucide-react'
 
-const API = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+const DEFAULT_API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '')
 
 type TableInfo = {
   schema: string
@@ -177,6 +182,21 @@ function App() {
   const [offset, setOffset] = useState(0)
   const [sidebarOpen, setSidebarOpen] = useState(false)
 
+  // Backend API Server / Tunnel state
+  const [apiUrl, setApiUrl] = useState<string>(() => {
+    try {
+      return localStorage.getItem('schemapilot_api_base_url') || DEFAULT_API
+    } catch {
+      return DEFAULT_API
+    }
+  })
+  const [showApiModal, setShowApiModal] = useState(false)
+  const [apiModalInput, setApiModalInput] = useState(apiUrl)
+  const [apiTestStatus, setApiTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle')
+  const [apiTestMessage, setApiTestMessage] = useState('')
+  const [apiGuideTab, setApiGuideTab] = useState<'tunnel' | 'vercel' | 'cloud'>('tunnel')
+  const [copiedCmd, setCopiedCmd] = useState('')
+
   // Connection management state
   const [currentConn, setCurrentConn] = useState<ConnectionInfo | null>(null)
   const [selectedProvider, setSelectedProvider] = useState<ProviderType>('mysql')
@@ -207,8 +227,15 @@ function App() {
     } catch {}
   }, [savedConnections])
 
+  function copyToClipboard(text: string, id: string) {
+    void navigator.clipboard.writeText(text)
+    setCopiedCmd(id)
+    setTimeout(() => setCopiedCmd(''), 2000)
+  }
+
   async function getJson<T>(path: string): Promise<T> {
-    const response = await fetch(`${API}${path}`)
+    const base = apiUrl.replace(/\/+$/, '')
+    const response = await fetch(`${base}${path}`)
     if (!response.ok) {
       const body = await response.json().catch(() => ({}))
       throw new Error(body.detail || `Request failed (${response.status})`)
@@ -217,7 +244,8 @@ function App() {
   }
 
   async function postJson<T>(path: string, payload: unknown): Promise<T> {
-    const response = await fetch(`${API}${path}`, {
+    const base = apiUrl.replace(/\/+$/, '')
+    const response = await fetch(`${base}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -227,6 +255,59 @@ function App() {
       throw new Error(body.detail || `Request failed (${response.status})`)
     }
     return response.json() as Promise<T>
+  }
+
+  async function testApiEndpoint(urlToTest = apiModalInput) {
+    setApiTestStatus('testing')
+    setApiTestMessage('')
+    const target = urlToTest.trim().replace(/\/+$/, '')
+    if (!target) {
+      setApiTestStatus('error')
+      setApiTestMessage('Please enter a server URL.')
+      return
+    }
+
+    const isHttps = typeof window !== 'undefined' && window.location.protocol === 'https:'
+    if (isHttps && target.startsWith('http://')) {
+      setApiTestStatus('error')
+      setApiTestMessage(
+        'Mixed Content Restriction: This site runs on HTTPS (Vercel). Browsers block calls to insecure "http://" endpoints. Use an HTTPS tunnel (e.g. npx localtunnel --port 8000) and enter the https:// URL.'
+      )
+      return
+    }
+
+    try {
+      const res = await fetch(`${target}/api/health`)
+      if (res.ok) {
+        const data = await res.json()
+        setApiTestStatus('success')
+        setApiTestMessage(`Connection successful! Dialect: ${data.dialect || 'connected'}`)
+      } else {
+        setApiTestStatus('error')
+        setApiTestMessage(`Server returned status ${res.status}`)
+      }
+    } catch (e) {
+      setApiTestStatus('error')
+      setApiTestMessage(
+        e instanceof Error
+          ? `Could not reach backend: ${e.message}. If running locally, make sure your tunnel is active and port 8000 is running.`
+          : 'Could not connect to backend server'
+      )
+    }
+  }
+
+  function handleSaveApiUrl(newUrl = apiModalInput) {
+    const cleaned = newUrl.trim().replace(/\/+$/, '')
+    if (!cleaned) return
+    setApiUrl(cleaned)
+    try {
+      localStorage.setItem('schemapilot_api_base_url', cleaned)
+    } catch {}
+    setShowApiModal(false)
+    setSuccessMsg(`Backend server URL set to: ${cleaned}`)
+    setTimeout(() => {
+      void loadInventory()
+    }, 100)
   }
 
   async function loadCurrentConnection() {
@@ -464,6 +545,21 @@ function App() {
             </nav>
           </div>
           <div className="top-actions">
+            <button
+              className="api-endpoint-badge"
+              onClick={() => {
+                setApiModalInput(apiUrl)
+                setShowApiModal(true)
+              }}
+              title="Click to view/change backend API server URL or configure Vercel tunnel"
+              aria-label="Configure backend API server endpoint"
+            >
+              <Server size={12} />
+              <span className="api-endpoint-text">
+                {apiUrl.replace(/^https?:\/\//, '')}
+              </span>
+              <Settings size={11} style={{ opacity: 0.7 }} />
+            </button>
             <span className={`status-dot ${status}`} aria-label={`Connection status: ${status}`} />
             <span>
               {status === 'connected'
@@ -487,8 +583,27 @@ function App() {
           {/* ─── Global Alerts ─── */}
           {error && (
             <div className="error-banner" role="alert">
-              <CircleHelp size={16} />
-              <span>{error}</span>
+              <CircleHelp size={16} style={{ flexShrink: 0 }} />
+              <div style={{ flex: 1 }}>
+                <div>{error}</div>
+                {(status === 'error' || error.toLowerCase().includes('failed to fetch') || error.toLowerCase().includes('network')) && (
+                  <div style={{ marginTop: 8, display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
+                    <button
+                      className="button small primary"
+                      style={{ padding: '4px 10px', fontSize: 11 }}
+                      onClick={() => {
+                        setApiModalInput(apiUrl)
+                        setShowApiModal(true)
+                      }}
+                    >
+                      <Server size={12} /> Configure Backend Server / Tunnel
+                    </button>
+                    <span style={{ fontSize: 11, opacity: 0.85 }}>
+                      Deploying to Vercel? Forward your local port 8000 via a free HTTPS tunnel (e.g. <code>npx localtunnel --port 8000</code>).
+                    </span>
+                  </div>
+                )}
+              </div>
               <button onClick={() => setError('')} aria-label="Dismiss error">
                 <X size={14} />
               </button>
@@ -1190,6 +1305,251 @@ function App() {
           )}
         </section>
       </main>
+
+      {/* ─── API Server & Vercel Tunnel Configuration Modal ─── */}
+      {showApiModal && (
+        <div className="api-modal-backdrop" onClick={() => setShowApiModal(false)}>
+          <div className="api-modal" onClick={e => e.stopPropagation()} role="dialog" aria-labelledby="api-modal-title">
+            <div className="api-modal-header">
+              <div className="api-modal-title">
+                <div className="provider-icon" style={{ background: 'var(--accent-muted)', color: 'var(--accent)' }}>
+                  <Server size={18} />
+                </div>
+                <div>
+                  <h3 id="api-modal-title">Backend API Server & Vercel Tunnel</h3>
+                  <p>Connect your Vercel deployment to your local computer or cloud backend</p>
+                </div>
+              </div>
+              <button className="icon-button" onClick={() => setShowApiModal(false)} aria-label="Close modal">
+                <X size={16} />
+              </button>
+            </div>
+
+            <div className="api-modal-body">
+              {/* Protocol Warning for Vercel / HTTPS */}
+              {typeof window !== 'undefined' &&
+                window.location.protocol === 'https:' &&
+                apiModalInput.trim().toLowerCase().startsWith('http://') && (
+                  <div className="tunnel-alert" role="alert">
+                    <strong>⚠️ Browser Mixed Content Block Detected</strong>
+                    Your frontend is loaded over HTTPS (Vercel). Browsers forbid calling insecure <code>http://</code> endpoints.
+                    To connect to a backend running on your computer, forward port 8000 via a free HTTPS tunnel (see guide below) and use the <code>https://</code> URL.
+                  </div>
+                )}
+
+              {/* Endpoint Input */}
+              <div className="form-group">
+                <label style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                  <span>Backend Server Base URL</span>
+                  <button
+                    type="button"
+                    style={{ background: 'none', border: 'none', color: 'var(--accent)', cursor: 'pointer', fontSize: 11 }}
+                    onClick={() => setApiModalInput('http://localhost:8000')}
+                  >
+                    Reset to Localhost
+                  </button>
+                </label>
+                <div style={{ display: 'flex', gap: 8 }}>
+                  <input
+                    type="url"
+                    className="conn-input"
+                    value={apiModalInput}
+                    onChange={e => {
+                      setApiModalInput(e.target.value)
+                      setApiTestStatus('idle')
+                      setApiTestMessage('')
+                    }}
+                    placeholder="https://your-tunnel.ngrok-free.app or http://localhost:8000"
+                    style={{ flex: 1 }}
+                  />
+                  <button
+                    type="button"
+                    className="button secondary"
+                    onClick={() => void testApiEndpoint(apiModalInput)}
+                    disabled={apiTestStatus === 'testing'}
+                    style={{ whiteSpace: 'nowrap' }}
+                  >
+                    {apiTestStatus === 'testing' ? (
+                      <>
+                        <RefreshCw size={13} className="spinning" /> Testing…
+                      </>
+                    ) : (
+                      'Test Ping'
+                    )}
+                  </button>
+                </div>
+              </div>
+
+              {/* Test Result Message */}
+              {apiTestMessage && (
+                <div
+                  style={{
+                    padding: '8px 12px',
+                    borderRadius: 'var(--radius-sm)',
+                    fontSize: 12,
+                    display: 'flex',
+                    alignItems: 'flex-start',
+                    gap: 8,
+                    background: apiTestStatus === 'success' ? 'rgba(16, 185, 129, 0.1)' : 'rgba(239, 68, 68, 0.1)',
+                    border: `1px solid ${apiTestStatus === 'success' ? 'rgba(16, 185, 129, 0.3)' : 'rgba(239, 68, 68, 0.3)'}`,
+                    color: apiTestStatus === 'success' ? '#34d399' : '#f87171'
+                  }}
+                >
+                  {apiTestStatus === 'success' ? (
+                    <CheckCircle2 size={15} style={{ flexShrink: 0, marginTop: 2 }} />
+                  ) : (
+                    <AlertTriangle size={15} style={{ flexShrink: 0, marginTop: 2 }} />
+                  )}
+                  <span>{apiTestMessage}</span>
+                </div>
+              )}
+
+              {/* Guide Tabs */}
+              <div className="api-tabs">
+                <button
+                  className={`api-tab-btn ${apiGuideTab === 'tunnel' ? 'active' : ''}`}
+                  onClick={() => setApiGuideTab('tunnel')}
+                >
+                  💻 Local Backend to Vercel
+                </button>
+                <button
+                  className={`api-tab-btn ${apiGuideTab === 'vercel' ? 'active' : ''}`}
+                  onClick={() => setApiGuideTab('vercel')}
+                >
+                  ⚡ Vercel Environment Variable
+                </button>
+                <button
+                  className={`api-tab-btn ${apiGuideTab === 'cloud' ? 'active' : ''}`}
+                  onClick={() => setApiGuideTab('cloud')}
+                >
+                  ☁️ Deploy Backend to Cloud
+                </button>
+              </div>
+
+              {/* Tab 1: Local Tunnel Guide */}
+              {apiGuideTab === 'tunnel' && (
+                <div className="tunnel-guide-box">
+                  <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text-primary)' }}>
+                    How to connect your Vercel frontend to your computer's backend:
+                  </div>
+                  <ol style={{ paddingLeft: 18, margin: 0 }}>
+                    <li style={{ marginBottom: 8 }}>
+                      Make sure your backend is running in your terminal:
+                      <div className="command-snippet">
+                        <span>uvicorn app.main:app --reload --port 8000</span>
+                        <button
+                          className="copy-cmd-btn"
+                          onClick={() => copyToClipboard('uvicorn app.main:app --reload --port 8000', 'uvicorn')}
+                        >
+                          {copiedCmd === 'uvicorn' ? 'Copied!' : 'Copy'}
+                        </button>
+                      </div>
+                    </li>
+                    <li style={{ marginBottom: 8 }}>
+                      Open a <strong>second terminal</strong> and create a free HTTPS tunnel:
+                      <div style={{ margin: '4px 0 2px', fontSize: 11, color: 'var(--text-muted)' }}>
+                        Option 1 (No signup, works instantly):
+                      </div>
+                      <div className="command-snippet">
+                        <span>npx localtunnel --port 8000</span>
+                        <button
+                          className="copy-cmd-btn"
+                          onClick={() => copyToClipboard('npx localtunnel --port 8000', 'localtunnel')}
+                        >
+                          {copiedCmd === 'localtunnel' ? 'Copied!' : 'Copy'}
+                        </button>
+                      </div>
+                      <div style={{ margin: '6px 0 2px', fontSize: 11, color: 'var(--text-muted)' }}>
+                        Option 2 (Ngrok):
+                      </div>
+                      <div className="command-snippet">
+                        <span>ngrok http 8000</span>
+                        <button
+                          className="copy-cmd-btn"
+                          onClick={() => copyToClipboard('ngrok http 8000', 'ngrok')}
+                        >
+                          {copiedCmd === 'ngrok' ? 'Copied!' : 'Copy'}
+                        </button>
+                      </div>
+                    </li>
+                    <li>
+                      Copy the resulting <code>https://...</code> URL and paste it into the input field above, then click <strong>Save & Apply</strong>.
+                    </li>
+                  </ol>
+                </div>
+              )}
+
+              {/* Tab 2: Vercel Settings */}
+              {apiGuideTab === 'vercel' && (
+                <div className="tunnel-guide-box">
+                  <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text-primary)' }}>
+                    Bake API URL permanently into your Vercel build:
+                  </div>
+                  <ol style={{ paddingLeft: 18, margin: 0 }}>
+                    <li style={{ marginBottom: 6 }}>
+                      Go to your <strong>Vercel Dashboard</strong> → Select your SchemaPilot Project.
+                    </li>
+                    <li style={{ marginBottom: 6 }}>
+                      Navigate to <strong>Settings</strong> → <strong>Environment Variables</strong>.
+                    </li>
+                    <li style={{ marginBottom: 6 }}>
+                      Add a new variable:
+                      <div style={{ background: 'var(--bg-surface-2)', padding: '6px 10px', borderRadius: 4, margin: '4px 0' }}>
+                        <div><strong>Key:</strong> <code>VITE_API_BASE_URL</code></div>
+                        <div><strong>Value:</strong> <code>https://your-tunnel-or-cloud-backend.com</code></div>
+                      </div>
+                    </li>
+                    <li>
+                      Go to the <strong>Deployments</strong> tab and click <strong>Redeploy</strong>.
+                    </li>
+                  </ol>
+                </div>
+              )}
+
+              {/* Tab 3: Free Cloud Backend */}
+              {apiGuideTab === 'cloud' && (
+                <div className="tunnel-guide-box">
+                  <div style={{ fontWeight: 600, marginBottom: 6, color: 'var(--text-primary)' }}>
+                    Want 24/7 backend without keeping your computer on?
+                  </div>
+                  <p style={{ margin: '4px 0 8px' }}>
+                    You can host the FastAPI backend for free on <strong>Render.com</strong> or <strong>Railway.app</strong>:
+                  </p>
+                  <ol style={{ paddingLeft: 18, margin: 0 }}>
+                    <li style={{ marginBottom: 6 }}>
+                      Create a free account on <a href="https://render.com" target="_blank" rel="noreferrer" style={{ color: 'var(--accent)' }}>Render.com</a>.
+                    </li>
+                    <li style={{ marginBottom: 6 }}>
+                      Click <strong>New +</strong> → <strong>Web Service</strong> → Connect your GitHub repository.
+                    </li>
+                    <li style={{ marginBottom: 6 }}>
+                      Set Root Directory to <code>backend</code>, Build Command: <code>pip install -r requirements.txt</code>, Start Command: <code>uvicorn app.main:app --host 0.0.0.0 --port $PORT</code>.
+                    </li>
+                    <li style={{ marginBottom: 6 }}>
+                      Add Environment Variables: <code>DATABASE_URL</code> and <code>CORS_ORIGINS=*</code>.
+                    </li>
+                    <li>
+                      Copy your free Render URL (e.g. <code>https://schemapilot-backend.onrender.com</code>) and paste it into SchemaPilot!
+                    </li>
+                  </ol>
+                </div>
+              )}
+            </div>
+
+            <div className="api-modal-footer">
+              <button className="button secondary" onClick={() => setShowApiModal(false)}>
+                Cancel
+              </button>
+              <button
+                className="button primary"
+                onClick={() => handleSaveApiUrl(apiModalInput)}
+              >
+                <Check size={14} /> Save & Apply Connection
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

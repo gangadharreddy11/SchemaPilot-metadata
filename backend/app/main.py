@@ -97,14 +97,30 @@ app = FastAPI(
     version="0.1.0",
 )
 
-origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://localhost:5174").split(",") if x.strip()]
+cors_val = os.getenv("CORS_ORIGINS", "*").strip()
+if not cors_val or "*" in cors_val:
+    origins = ["*"]
+else:
+    origins = [x.strip() for x in cors_val.split(",") if x.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins if origins else ["*"],
+    allow_origins=origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.get("/")
+def root_status():
+    return {
+        "status": "ok",
+        "name": "SchemaPilot API",
+        "version": "0.1.0",
+        "docs_url": "/docs",
+        "health_url": "/api/health"
+    }
 
 
 def sanitize_error(exc: Exception) -> str:
