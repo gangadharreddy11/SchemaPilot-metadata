@@ -129,8 +129,8 @@ const PROVIDERS: ProviderPreset[] = [
     name: 'Supabase',
     tag: 'Cloud PostgreSQL',
     driver: 'postgresql+psycopg2',
-    template: 'postgresql://postgres:[YOUR-PASSWORD]@db.[PROJECT-REF].supabase.co:5432/postgres',
-    tip: 'Find your connection string in Supabase Dashboard → Project Settings → Database → Connection string URI'
+    template: 'postgresql://postgres.[PROJECT-REF]:[YOUR-PASSWORD]@aws-0-[REGION].pooler.supabase.com:6543/postgres',
+    tip: 'Important: Direct (db.*.supabase.co) requires IPv6. For Windows/IPv4, copy the "Connection Pooler" URI (port 6543 or 5432) from Supabase Dashboard → Project Settings → Database → Connection string.'
   },
   {
     id: 'oracle',
@@ -601,6 +601,13 @@ function App() {
                     <span style={{ fontSize: 11, opacity: 0.85 }}>
                       Deploying to Vercel? Forward your local port 8000 via a free HTTPS tunnel (e.g. <code>npx localtunnel --port 8000</code>).
                     </span>
+                  </div>
+                )}
+                {error.includes('supabase.co') && (error.includes('timed out') || error.includes('10060')) && (
+                  <div style={{ marginTop: 8, fontSize: 12, padding: '8px 12px', background: 'rgba(239, 68, 68, 0.1)', borderRadius: 6, border: '1px solid rgba(239, 68, 68, 0.25)' }}>
+                    <strong>IPv6 Timeout Detected:</strong> Supabase direct host (<code>db.*.supabase.co</code>) only supports IPv6, which is not routed by your network.
+                    <br />
+                    <strong>Fix:</strong> In your Supabase dashboard, go to <strong>Project Settings → Database → Connection string</strong>, select <strong>Connection pooler</strong> (port 6543 or 5432 with <code>pooler.supabase.com</code>) which supports IPv4.
                   </div>
                 )}
               </div>
