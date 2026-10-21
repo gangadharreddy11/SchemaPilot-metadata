@@ -1,1 +1,1 @@
-# Root app package alias to support `uvicorn app.main:app`
+"""App package forwarding to backend.app"""
