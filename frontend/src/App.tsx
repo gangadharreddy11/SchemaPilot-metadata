@@ -2,32 +2,179 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   Activity,
   AlertTriangle,
+  Bookmark,
   Boxes,
   Check,
   CheckCircle2,
+  ChevronDown,
   ChevronRight,
   CircleHelp,
   Copy,
   Database,
   Download,
   ExternalLink,
+  FileSpreadsheet,
+  Filter,
   GitBranch,
   Globe,
   KeyRound,
   LayoutDashboard,
   Menu,
+  Moon,
+  Play,
   Plug,
+  Plus,
   RefreshCw,
   Search,
   Server,
   Settings,
   ShieldCheck,
+  Sparkles,
+  Sun,
   Table2,
   Trash2,
   X
 } from 'lucide-react'
 
 const DEFAULT_API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '')
+
+type FilterRule = {
+  id: string
+  column: string
+  operator: string
+  value: string
+}
+
+type SavedSelection = {
+  id: string
+  name: string
+  description?: string
+  schema_name: string
+  table: string
+  columns: string[]
+  filters: { column: string; operator: string; value: any }[]
+  conjunction: 'AND' | 'OR'
+  created_at: string
+}
+
+type QueryResult = {
+  schema: string
+  table: string
+  columns: string[]
+  total_matching: number
+  limit: number
+  offset: number
+  rows: Record<string, unknown>[]
+}
+
+function getOperatorsForType(dataType: string) {
+  const dt = (dataType || '').toUpperCase()
+  const isNumeric = /INT|NUMERIC|DECIMAL|FLOAT|DOUBLE|REAL|SERIAL|BIGINT|SMALLINT/.test(dt)
+  const isDate = /DATE|TIME|TIMESTAMP/.test(dt)
+  const isBoolean = /BOOL/.test(dt)
+
+  if (isNumeric) {
+    return [
+      { value: 'equals', label: '= Equals' },
+      { value: 'not_equals', label: '!= Not equals' },
+      { value: 'greater_than', label: '> Greater than' },
+      { value: 'greater_than_or_equal', label: '>= Greater than or equal' },
+      { value: 'less_than', label: '< Less than' },
+      { value: 'less_than_or_equal', label: '<= Less than or equal' },
+      { value: 'is_empty', label: 'Is empty / NULL' },
+      { value: 'is_not_empty', label: 'Is not empty / NOT NULL' },
+    ]
+  }
+
+  if (isDate) {
+    return [
+      { value: 'equals', label: '= On date' },
+      { value: 'not_equals', label: '!= Not on date' },
+      { value: 'greater_than', label: '> After date' },
+      { value: 'greater_than_or_equal', label: '>= On or after' },
+      { value: 'less_than', label: '< Before date' },
+      { value: 'less_than_or_equal', label: '<= On or before' },
+      { value: 'is_empty', label: 'Is empty / NULL' },
+      { value: 'is_not_empty', label: 'Is not empty / NOT NULL' },
+    ]
+  }
+
+  if (isBoolean) {
+    return [
+      { value: 'equals', label: '= Equals (true / false)' },
+      { value: 'is_empty', label: 'Is empty / NULL' },
+      { value: 'is_not_empty', label: 'Is not empty' },
+    ]
+  }
+
+  // String / Text
+  return [
+    { value: 'contains', label: 'Contains (case-insensitive)' },
+    { value: 'equals', label: '= Equals exact' },
+    { value: 'not_equals', label: '!= Not equals' },
+    { value: 'starts_with', label: 'Starts with' },
+    { value: 'ends_with', label: 'Ends with' },
+    { value: 'is_empty', label: 'Is empty (blank or NULL)' },
+    { value: 'is_not_empty', label: 'Is not empty' },
+  ]
+}
+
+function exportToExcelCSV(table: string, columns: string[], rows: Record<string, unknown>[]) {
+  if (!rows || rows.length === 0) return
+  const header = columns.map(c => `"${c.replace(/"/g, '""')}"`).join(',')
+  const lines = rows.map(r =>
+    columns.map(c => {
+      const v = r[c]
+      if (v === null || v === undefined) return '""'
+      return `"${String(v).replace(/"/g, '""')}"`
+    }).join(',')
+  )
+  const csv = '\uFEFF' + [header, ...lines].join('\r\n')
+  const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `schemapilot-${table}-selection.csv`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function exportToExcelXLS(table: string, columns: string[], rows: Record<string, unknown>[]) {
+  if (!rows || rows.length === 0) return
+  let html = '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:x="urn:schemas-microsoft-com:office:excel" xmlns="http://www.w3.org/TR/REC-html40">'
+  html += '<head><meta charset="utf-8"><!--[if gte mso 9]><xml><x:ExcelWorkbook><x:ExcelWorksheets><x:ExcelWorksheet><x:Name>Selection</x:Name><x:WorksheetOptions><x:DisplayGridlines/></x:WorksheetOptions></x:ExcelWorksheet></x:ExcelWorksheets></x:ExcelWorkbook></xml><![endif]--></head><body>'
+  html += '<table border="1"><thead><tr>'
+  columns.forEach(c => { html += `<th style="background-color:#0f172a;color:#3ecfb4;font-weight:bold;padding:8px 14px;">${c}</th>` })
+  html += '</tr></thead><tbody>'
+  rows.forEach(r => {
+    html += '<tr>'
+    columns.forEach(c => {
+      const val = r[c] === null || r[c] === undefined ? '' : String(r[c])
+      html += `<td style="padding:6px 10px;">${val.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</td>`
+    })
+    html += '</tr>'
+  })
+  html += '</tbody></table></body></html>'
+  const blob = new Blob([html], { type: 'application/vnd.ms-excel;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `schemapilot-${table}-selection.xls`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
+function exportSelectionJSON(table: string, columns: string[], rows: Record<string, unknown>[]) {
+  const payload = JSON.stringify(rows, null, 2)
+  const blob = new Blob([payload], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = `schemapilot-${table}-selection.json`
+  a.click()
+  URL.revokeObjectURL(url)
+}
+
 
 type TableInfo = {
   schema: string
@@ -166,7 +313,7 @@ type SavedConnection = {
 }
 
 function App() {
-  const [nav, setNav] = useState<'Overview' | 'Connections' | 'Schemas' | 'Tables' | 'Relationships'>('Overview')
+  const [nav, setNav] = useState<'Overview' | 'Saved Data Selections' | 'Connections' | 'Schemas' | 'Tables' | 'Relationships'>('Overview')
   const [schema, setSchema] = useState('public')
   const [schemas, setSchemas] = useState<string[]>(['public'])
   const [tables, setTables] = useState<TableInfo[]>([])
@@ -181,6 +328,78 @@ function App() {
   const [successMsg, setSuccessMsg] = useState('')
   const [offset, setOffset] = useState(0)
   const [sidebarOpen, setSidebarOpen] = useState(false)
+  const [theme, setTheme] = useState<'light' | 'dark'>(() => {
+    try {
+      const stored = localStorage.getItem('schemapilot_theme')
+      if (stored === 'dark' || stored === 'light') return stored
+    } catch {}
+    return 'light' // Default to light mode for the redesign
+  })
+
+  useEffect(() => {
+    document.documentElement.setAttribute('data-theme', theme)
+    try {
+      localStorage.setItem('schemapilot_theme', theme)
+    } catch {}
+  }, [theme])
+
+  // ─── Saved Data Selections Studio State ───
+  const [selTable, setSelTable] = useState<string>('customers')
+  const [selTableSearch, setSelTableSearch] = useState<string>('')
+  const [selColSearch, setSelColSearch] = useState<string>('')
+  const [selColumns, setSelColumns] = useState<string[]>(['name', 'email'])
+  const [selFilters, setSelFilters] = useState<FilterRule[]>([])
+  const [selConjunction, setSelConjunction] = useState<'AND' | 'OR'>('AND')
+  const [selTableDetail, setSelTableDetail] = useState<Detail | null>(null)
+  const [selLoadingDetail, setSelLoadingDetail] = useState<boolean>(false)
+  const [selQuerying, setSelQuerying] = useState<boolean>(false)
+  const [selQueryResult, setSelQueryResult] = useState<QueryResult | null>(null)
+  const [selQueryError, setSelQueryError] = useState<string>('')
+  const [savedSelections, setSavedSelections] = useState<SavedSelection[]>(() => {
+    try {
+      const stored = localStorage.getItem('schemapilot_saved_selections')
+      if (stored) return JSON.parse(stored)
+    } catch {}
+    return [
+      {
+        id: 'preset-1',
+        name: 'Customers with "Ravi"',
+        description: 'Filters customers whose name contains Ravi',
+        schema_name: 'public',
+        table: 'customers',
+        columns: ['name', 'email'],
+        filters: [{ column: 'name', operator: 'contains', value: 'Ravi' }],
+        conjunction: 'AND',
+        created_at: '2026-01-01T00:00:00Z'
+      },
+      {
+        id: 'preset-2',
+        name: 'Completed Payments',
+        description: "All payments with payment_status = 'completed'",
+        schema_name: 'public',
+        table: 'payments',
+        columns: ['payment_id', 'amount', 'payment_status', 'paid_at'],
+        filters: [{ column: 'payment_status', operator: 'equals', value: 'completed' }],
+        conjunction: 'AND',
+        created_at: '2026-01-01T00:00:00Z'
+      },
+      {
+        id: 'preset-3',
+        name: 'High Value Products (> 100)',
+        description: 'Products with unit price greater than 100',
+        schema_name: 'public',
+        table: 'products',
+        columns: ['name', 'price', 'stock'],
+        filters: [{ column: 'price', operator: 'greater_than', value: '100' }],
+        conjunction: 'AND',
+        created_at: '2026-01-01T00:00:00Z'
+      }
+    ]
+  })
+  const [showSaveModal, setShowSaveModal] = useState<boolean>(false)
+  const [saveNameInput, setSaveNameInput] = useState<string>('')
+  const [saveDescInput, setSaveDescInput] = useState<string>('')
+
 
   // Backend API Server / Tunnel state
   const [apiUrl, setApiUrl] = useState<string>(() => {
@@ -341,6 +560,8 @@ function App() {
         setSelected('')
         setDetail(null)
         setRows(null)
+      } else if (!selected && tableData.tables.length > 0) {
+        void openTable(tableData.tables[0].name, nextSchema)
       }
       void loadCurrentConnection()
     } catch (e) {
@@ -349,15 +570,15 @@ function App() {
     }
   }
 
-  async function openTable(name: string) {
+  async function openTable(name: string, tableSchema = schema) {
     setSelected(name)
     setTab('Columns')
     setOffset(0)
     setError('')
     try {
       const [meta, data] = await Promise.all([
-        getJson<Detail>(`/api/tables/${encodeURIComponent(name)}/metadata?schema=${encodeURIComponent(schema)}`),
-        getJson<Rows>(`/api/tables/${encodeURIComponent(name)}/rows?schema=${encodeURIComponent(schema)}&limit=25&offset=0`)
+        getJson<Detail>(`/api/tables/${encodeURIComponent(name)}/metadata?schema=${encodeURIComponent(tableSchema)}`),
+        getJson<Rows>(`/api/tables/${encodeURIComponent(name)}/rows?schema=${encodeURIComponent(tableSchema)}&limit=25&offset=0`)
       ])
       setDetail(meta)
       setRows(data)
@@ -443,9 +664,246 @@ function App() {
     setSavedConnections(prev => prev.filter(c => c.id !== id))
   }
 
+  // ─── Saved Data Selections Action Methods ───
+  async function loadSavedSelections() {
+    try {
+      const data = await getJson<{ selections: SavedSelection[] }>('/api/saved-selections')
+      if (data && Array.isArray(data.selections) && data.selections.length > 0) {
+        setSavedSelections(data.selections)
+        try {
+          localStorage.setItem('schemapilot_saved_selections', JSON.stringify(data.selections))
+        } catch {}
+      }
+    } catch {}
+  }
+
+  async function openSelectionTable(tableName: string) {
+    setSelTable(tableName)
+    setSelLoadingDetail(true)
+    setSelQueryError('')
+    setSelQueryResult(null)
+    try {
+      const meta = await getJson<Detail>(
+        `/api/tables/${encodeURIComponent(tableName)}/metadata?schema=${encodeURIComponent(schema)}`
+      )
+      setSelTableDetail(meta)
+      if (meta.schema && meta.schema !== schema) {
+        setSchema(meta.schema)
+        void loadInventory(meta.schema)
+      }
+      const cols = meta.columns.map(c => c.name)
+      setSelColumns(cols.slice(0, Math.min(4, cols.length)))
+      setSelFilters([])
+    } catch (e) {
+      setSelQueryError(e instanceof Error ? e.message : 'Could not fetch table columns')
+    } finally {
+      setSelLoadingDetail(false)
+    }
+  }
+
+  function handleToggleColumn(colName: string) {
+    setSelColumns(prev =>
+      prev.includes(colName) ? prev.filter(c => c !== colName) : [...prev, colName]
+    )
+  }
+
+  function handleSelectAllColumns() {
+    if (!selTableDetail) return
+    setSelColumns(selTableDetail.columns.map(c => c.name))
+  }
+
+  function handleClearAllColumns() {
+    setSelColumns([])
+  }
+
+  function handleAddFilter() {
+    if (!selTableDetail || selTableDetail.columns.length === 0) return
+    const firstCol = selTableDetail.columns[0]
+    const ops = getOperatorsForType(firstCol.data_type)
+    const newRule: FilterRule = {
+      id: String(Date.now()),
+      column: firstCol.name,
+      operator: ops[0]?.value || 'equals',
+      value: ''
+    }
+    setSelFilters(prev => [...prev, newRule])
+  }
+
+  function handleUpdateFilter(id: string, field: 'column' | 'operator' | 'value', val: any) {
+    setSelFilters(prev =>
+      prev.map(f => {
+        if (f.id !== id) return f
+        if (field === 'column') {
+          const colObj = selTableDetail?.columns.find(c => c.name === val)
+          const newOps = getOperatorsForType(colObj?.data_type || '')
+          return {
+            ...f,
+            column: val,
+            operator: newOps[0]?.value || 'equals',
+            value: ''
+          }
+        }
+        return { ...f, [field]: val }
+      })
+    )
+  }
+
+  function handleRemoveFilter(id: string) {
+    setSelFilters(prev => prev.filter(f => f.id !== id))
+  }
+
+  function handleClearAllFilters() {
+    setSelFilters([])
+  }
+
+  async function handleExecuteQuery() {
+    if (!selTable) {
+      setSelQueryError('Please select a database table.')
+      return
+    }
+    if (selColumns.length === 0) {
+      setSelQueryError('Validation Error: At least one column must be selected before previewing data.')
+      return
+    }
+    setSelQuerying(true)
+    setSelQueryError('')
+    try {
+      const payload = {
+        schema_name: schema,
+        table: selTable,
+        columns: selColumns,
+        filters: selFilters.filter(f => f.column && f.operator).map(f => ({
+          column: f.column,
+          operator: f.operator,
+          value: f.value
+        })),
+        conjunction: selConjunction,
+        limit: 50,
+        offset: 0
+      }
+      const res = await postJson<QueryResult>('/api/query', payload)
+      setSelQueryResult(res)
+    } catch (e) {
+      setSelQueryError(e instanceof Error ? e.message : 'Query execution failed')
+    } finally {
+      setSelQuerying(false)
+    }
+  }
+
+  async function handleLoadSelection(sel: SavedSelection) {
+    setNav('Saved Data Selections')
+    setSelTable(sel.table)
+    setSelLoadingDetail(true)
+    setSelQueryError('')
+    setSelQueryResult(null)
+    try {
+      const targetSchema = sel.schema_name || schema || 'public'
+      const meta = await getJson<Detail>(
+        `/api/tables/${encodeURIComponent(sel.table)}/metadata?schema=${encodeURIComponent(targetSchema)}`
+      )
+      setSelTableDetail(meta)
+
+      // Ensure active schema is synchronized to the table's actual schema
+      if (meta.schema && meta.schema !== schema) {
+        setSchema(meta.schema)
+        void loadInventory(meta.schema)
+      }
+
+      // Reconcile columns: filter to columns that actually exist in the table
+      const tableColNames = meta.columns.map(c => c.name)
+      const validCols = (sel.columns || []).filter(c => tableColNames.includes(c))
+      const finalCols = validCols.length > 0 ? validCols : tableColNames.slice(0, Math.min(4, tableColNames.length))
+      setSelColumns(finalCols)
+
+      // Reconcile filters
+      const validFilters = (sel.filters || []).filter(f => tableColNames.includes(f.column))
+      setSelFilters(validFilters.map((f, i) => ({
+        id: String(Date.now() + i),
+        column: f.column,
+        operator: f.operator,
+        value: String(f.value ?? '')
+      })))
+      setSelConjunction(sel.conjunction || 'AND')
+
+      // Auto run preview query
+      setSelQuerying(true)
+      const qRes = await postJson<QueryResult>('/api/query', {
+        schema_name: meta.schema,
+        table: sel.table,
+        columns: finalCols,
+        filters: validFilters,
+        conjunction: sel.conjunction || 'AND',
+        limit: 50,
+        offset: 0
+      })
+      setSelQueryResult(qRes)
+      setSuccessMsg(`Loaded & executed: "${sel.name}" (${qRes.total_matching} records matched)`)
+    } catch (e) {
+      setSelQueryError(e instanceof Error ? e.message : 'Failed to load saved selection')
+    } finally {
+      setSelLoadingDetail(false)
+      setSelQuerying(false)
+    }
+  }
+
+  async function handleSaveSelection() {
+    if (!saveNameInput.trim()) {
+      setSelQueryError('Please provide a name for this saved selection.')
+      return
+    }
+    if (selColumns.length === 0) {
+      setSelQueryError('At least one column must be selected.')
+      return
+    }
+    const targetSchema = selTableDetail?.schema || schema || 'public'
+    const newEntry: SavedSelection = {
+      id: String(Date.now()),
+      name: saveNameInput.trim(),
+      description: saveDescInput.trim(),
+      schema_name: targetSchema,
+      table: selTable,
+      columns: selColumns,
+      filters: selFilters.map(f => ({ column: f.column, operator: f.operator, value: f.value })),
+      conjunction: selConjunction,
+      created_at: new Date().toISOString()
+    }
+
+    try {
+      await postJson('/api/saved-selections', newEntry).catch(() => {})
+    } catch {}
+
+    setSavedSelections(prev => {
+      const updated = [newEntry, ...prev.filter(x => x.name !== newEntry.name)]
+      try {
+        localStorage.setItem('schemapilot_saved_selections', JSON.stringify(updated))
+      } catch {}
+      return updated
+    })
+    setShowSaveModal(false)
+    setSaveNameInput('')
+    setSaveDescInput('')
+    setSuccessMsg(`Selection "${newEntry.name}" saved successfully!`)
+  }
+
+
+  async function handleDeleteSavedSelection(id: string) {
+    try {
+      await fetch(`${apiUrl.replace(/\/+$/, '')}/api/saved-selections/${id}`, { method: 'DELETE' }).catch(() => {})
+    } catch {}
+    setSavedSelections(prev => {
+      const updated = prev.filter(s => s.id !== id)
+      try {
+        localStorage.setItem('schemapilot_saved_selections', JSON.stringify(updated))
+      } catch {}
+      return updated
+    })
+  }
+
   useEffect(() => {
     void loadInventory('public')
+    void loadSavedSelections()
   }, [])
+
 
   const filtered = useMemo(
     () => tables.filter(t => t.name.toLowerCase().includes(search.toLowerCase())),
@@ -487,15 +945,29 @@ function App() {
           <div className="brand-mark" aria-hidden="true">
             <Database size={18} />
           </div>
-          <div>
-            <strong>SchemaPilot</strong>
-            <span>Database Studio</span>
+          <div className="brand-text">
+            <div className="brand-title-row">
+              <strong>SchemaPilot</strong>
+              <span className="brand-badge">ENTERPRISE</span>
+            </div>
+            <span>Database Intelligence</span>
           </div>
         </div>
 
         <div className="nav-label">Workspace</div>
         <button className={`nav-item ${nav === 'Overview' ? 'active' : ''}`} onClick={() => handleNavClick('Overview')}>
           <LayoutDashboard size={16} /> Overview
+        </button>
+        <button
+          className={`nav-item ${nav === 'Saved Data Selections' ? 'active' : ''}`}
+          onClick={() => {
+            handleNavClick('Saved Data Selections')
+            if (!selTableDetail && tables.length > 0) {
+              void openSelectionTable(selTable || tables[0].name)
+            }
+          }}
+        >
+          <Bookmark size={16} /> Saved Data Selections <span className="nav-count">{savedSelections.length}</span>
         </button>
         <button className={`nav-item ${nav === 'Connections' ? 'active' : ''}`} onClick={() => handleNavClick('Connections')}>
           <Database size={16} /> Connections <span className="nav-count">{savedConnections.length}</span>
@@ -576,6 +1048,14 @@ function App() {
             >
               <RefreshCw size={15} />
             </button>
+            <button
+              className="icon-button theme-toggle-btn"
+              onClick={() => setTheme(t => (t === 'light' ? 'dark' : 'light'))}
+              title={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+              aria-label={`Switch to ${theme === 'light' ? 'dark' : 'light'} mode`}
+            >
+              {theme === 'light' ? <Moon size={15} /> : <Sun size={15} />}
+            </button>
           </div>
         </header>
 
@@ -623,6 +1103,693 @@ function App() {
               <button onClick={() => setSuccessMsg('')} style={{ background: 'transparent', border: 0, color: 'inherit' }} aria-label="Dismiss success message">
                 <X size={14} />
               </button>
+            </div>
+          )}
+
+          {/* ════════════════════════════════════════
+              VIEW: SAVED DATA SELECTIONS STUDIO
+              ════════════════════════════════════════ */}
+          {nav === 'Saved Data Selections' && (
+            <div className="selections-studio">
+              <div className="page-heading">
+                <div>
+                  <div className="eyebrow">Database Intelligence & Extraction</div>
+                  <h1>Saved Data Selections</h1>
+                  <p>
+                    Dynamically discover database tables, select custom column projections, build type-aware parameterized filters, live preview records, and export to Excel / CSV.
+                  </p>
+                </div>
+                <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+                  <button
+                    className="button primary"
+                    onClick={() => void handleExecuteQuery()}
+                    disabled={selQuerying || selColumns.length === 0}
+                  >
+                    {selQuerying ? (
+                      <>
+                        <RefreshCw size={13} className="spinning" /> Querying…
+                      </>
+                    ) : (
+                      <>
+                        <Play size={13} /> Preview Data
+                      </>
+                    )}
+                  </button>
+                  <button
+                    className="button secondary"
+                    onClick={() => {
+                      setSaveNameInput(selTable ? `${selTable.toUpperCase()} Selection` : '')
+                      setShowSaveModal(true)
+                    }}
+                    disabled={!selTable || selColumns.length === 0}
+                  >
+                    <Bookmark size={13} /> Save Selection
+                  </button>
+                  <button
+                    className="button secondary"
+                    onClick={() => exportToExcelCSV(selTable, selColumns, selQueryResult?.rows || [])}
+                    disabled={!selQueryResult || selQueryResult.rows.length === 0}
+                    title="Download comma-separated values file (opens in Microsoft Excel)"
+                  >
+                    <FileSpreadsheet size={13} /> Export Excel (.csv)
+                  </button>
+                  <button
+                    className="button secondary"
+                    onClick={() => exportToExcelXLS(selTable, selColumns, selQueryResult?.rows || [])}
+                    disabled={!selQueryResult || selQueryResult.rows.length === 0}
+                    title="Download formatted Excel HTML spreadsheet"
+                  >
+                    <Download size={13} /> Export Excel (.xls)
+                  </button>
+                  <button
+                    className="button secondary"
+                    onClick={() => exportSelectionJSON(selTable, selColumns, selQueryResult?.rows || [])}
+                    disabled={!selQueryResult || selQueryResult.rows.length === 0}
+                    title="Download raw JSON projection"
+                  >
+                    <Download size={13} /> Export JSON
+                  </button>
+                </div>
+              </div>
+
+              {/* Active Connection Bar */}
+              <div className="connection-bar">
+                <div className="connection-icon">
+                  <Database size={18} />
+                </div>
+                <div className="connection-info">
+                  <span>Schema Selection</span>
+                  <strong>
+                    {currentConn?.dialect ? currentConn.dialect.toUpperCase() : 'Database'} · Schema: {schema}
+                  </strong>
+                </div>
+                <div className="schema-picker">
+                  <label htmlFor="studio-schema">Schema</label>
+                  <select
+                    id="studio-schema"
+                    value={schema}
+                    onChange={e => {
+                      setSchema(e.target.value)
+                      void loadInventory(e.target.value)
+                      setSelTableDetail(null)
+                      setSelQueryResult(null)
+                    }}
+                  >
+                    {schemas.map(s => (
+                      <option key={s} value={s}>
+                        {s}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div className="live-badge">
+                  <span /> DYNAMIC INSPECTOR
+                </div>
+              </div>
+
+              {selQueryError && (
+                <div className="error-banner" role="alert">
+                  <AlertTriangle size={16} style={{ flexShrink: 0 }} />
+                  <span>{selQueryError}</span>
+                  <button onClick={() => setSelQueryError('')} aria-label="Dismiss error">
+                    <X size={14} />
+                  </button>
+                </div>
+              )}
+
+              {/* ─── Studio Main 2-Column Grid ─── */}
+              <div className="studio-grid">
+                {/* ─── LEFT COLUMN: Dynamic Table Discovery + Saved Configurations ─── */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-5)' }}>
+                  {/* Step 1: Automatic Table Discovery */}
+                  <div className="studio-card">
+                    <div className="studio-card-header">
+                      <div className="studio-card-title">
+                        <div className="step-num-badge">1</div>
+                        <div>
+                          <h3>Select Table</h3>
+                          <p>{tables.length} tables discovered in schema "{schema}"</p>
+                        </div>
+                      </div>
+                      <span className="count-pill">{tables.length}</span>
+                    </div>
+
+                    <div className="search-box" style={{ margin: 0 }}>
+                      <Search size={14} />
+                      <input
+                        placeholder="Search discovered tables…"
+                        value={selTableSearch}
+                        onChange={e => setSelTableSearch(e.target.value)}
+                        aria-label="Search discovered tables"
+                      />
+                    </div>
+
+                    <div className="table-picker-scroll">
+                      {tables
+                        .filter(t => t.name.toLowerCase().includes(selTableSearch.toLowerCase()))
+                        .map(t => {
+                          const isActive = selTable === t.name
+                          return (
+                            <button
+                              key={t.name}
+                              className={`table-picker-item ${isActive ? 'active' : ''}`}
+                              onClick={() => void openSelectionTable(t.name)}
+                              aria-label={`Select table ${t.name}`}
+                            >
+                              <div className="table-picker-info">
+                                <strong>{t.name}</strong>
+                                <span>
+                                  {t.column_count} cols · {t.primary_key_constraint_count} PK · {t.foreign_key_constraint_count} FK
+                                </span>
+                              </div>
+                              <ChevronRight size={14} style={{ opacity: isActive ? 1 : 0.4 }} />
+                            </button>
+                          )
+                        })}
+                      {tables.filter(t => t.name.toLowerCase().includes(selTableSearch.toLowerCase())).length === 0 && (
+                        <div className="empty">No matching tables found.</div>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Saved Selections / Presets */}
+                  <div className="studio-card">
+                    <div className="studio-card-header">
+                      <div className="studio-card-title">
+                        <Bookmark size={16} style={{ color: 'var(--accent)' }} />
+                        <div>
+                          <h3>Saved Configurations</h3>
+                          <p>{savedSelections.length} saved selection(s)</p>
+                        </div>
+                      </div>
+                    </div>
+
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                      {savedSelections.map(sel => (
+                        <div key={sel.id} className="saved-preset-card">
+                          <div className="saved-preset-header">
+                            <div className="saved-preset-title">
+                              <strong>{sel.name}</strong>
+                              <span>
+                                Table: <code>{sel.table}</code> ({sel.columns.length} cols)
+                              </span>
+                            </div>
+                            <span className="pill primary" style={{ fontSize: 9 }}>
+                              {sel.conjunction || 'AND'}
+                            </span>
+                          </div>
+
+                          {sel.description && (
+                            <div style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>{sel.description}</div>
+                          )}
+
+                          <div className="saved-preset-meta">
+                            <div>
+                              <strong>Columns:</strong> {sel.columns.join(', ')}
+                            </div>
+                            {sel.filters && sel.filters.length > 0 && (
+                              <div>
+                                <strong>Filters ({sel.filters.length}):</strong>{' '}
+                                {sel.filters.map(f => `${f.column} ${f.operator} "${f.value || ''}"`).join(` ${sel.conjunction} `)}
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="saved-preset-actions">
+                            <button
+                              className="button small primary"
+                              onClick={() => void handleLoadSelection(sel)}
+                              disabled={selLoadingDetail || selQuerying}
+                            >
+                              <Play size={11} /> Load & Run
+                            </button>
+                            <button
+                              className="button small secondary"
+                              onClick={() => void handleDeleteSavedSelection(sel.id)}
+                              title="Delete saved configuration"
+                              aria-label={`Delete configuration ${sel.name}`}
+                            >
+                              <Trash2 size={12} />
+                            </button>
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+
+                {/* ─── RIGHT COLUMN: Column Selection + Filters + Data Preview ─── */}
+                <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--sp-5)' }}>
+                  {/* Step 2: Column Selection */}
+                  <div className="studio-card">
+                    <div className="studio-card-header">
+                      <div className="studio-card-title">
+                        <div className="step-num-badge">2</div>
+                        <div>
+                          <h3>
+                            Column Selection · <code style={{ color: 'var(--accent)' }}>{selTable}</code>
+                          </h3>
+                          <p>
+                            Select columns with checkboxes. The preview and Excel export will contain ONLY selected columns.
+                          </p>
+                        </div>
+                      </div>
+                      <span className="count-pill">
+                        {selColumns.length} / {selTableDetail?.columns.length || 0} Selected
+                      </span>
+                    </div>
+
+                    {/* Column Toolbar */}
+                    <div className="columns-toolbar">
+                      <input
+                        className="column-search-input"
+                        placeholder="Search columns…"
+                        value={selColSearch}
+                        onChange={e => setSelColSearch(e.target.value)}
+                        aria-label="Search columns"
+                      />
+                      <div className="columns-quick-actions">
+                        <button
+                          type="button"
+                          className="button small secondary"
+                          onClick={handleSelectAllColumns}
+                          disabled={!selTableDetail}
+                        >
+                          Select All
+                        </button>
+                        <button
+                          type="button"
+                          className="button small secondary"
+                          onClick={handleClearAllColumns}
+                          disabled={!selTableDetail || selColumns.length === 0}
+                        >
+                          Clear All
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Validation Warning */}
+                    {selColumns.length === 0 ? (
+                      <div className="error-banner" style={{ margin: 0 }}>
+                        <AlertTriangle size={15} style={{ flexShrink: 0 }} />
+                        <span>At least one column must be selected before saving, previewing, or exporting data.</span>
+                      </div>
+                    ) : (
+                      <div className="active-projection-pills">
+                        <span style={{ color: 'var(--text-tertiary)', fontWeight: 600 }}>Active Projection ({selColumns.length}):</span>
+                        {selColumns.map(c => (
+                          <span key={c} className="projection-pill">
+                            {c}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+
+                    {/* Column Checkbox Grid */}
+                    {selLoadingDetail ? (
+                      <div className="empty">
+                        <RefreshCw size={16} className="spinning" /> Loading table columns…
+                      </div>
+                    ) : (
+                      <div className="column-checkbox-grid">
+                        {(selTableDetail?.columns || [])
+                          .filter(c => c.name.toLowerCase().includes(selColSearch.toLowerCase()))
+                          .map(c => {
+                            const isChecked = selColumns.includes(c.name)
+                            return (
+                              <label
+                                key={c.name}
+                                className={`column-checkbox-card ${isChecked ? 'checked' : ''}`}
+                              >
+                                <input
+                                  type="checkbox"
+                                  checked={isChecked}
+                                  onChange={() => handleToggleColumn(c.name)}
+                                />
+                                <div className="column-meta-wrap">
+                                  <strong>{c.name}</strong>
+                                  <span>{c.data_type}</span>
+                                </div>
+                                <div className="tag-list" style={{ marginLeft: 'auto' }}>
+                                  {c.primary_key && <span className="pill primary">PK</span>}
+                                  {c.foreign_key && <span className="pill foreign">FK</span>}
+                                  {c.unique && <span className="pill unique">UQ</span>}
+                                </div>
+                              </label>
+                            )
+                          })}
+                        {(selTableDetail?.columns || []).filter(c =>
+                          c.name.toLowerCase().includes(selColSearch.toLowerCase())
+                        ).length === 0 && (
+                          <div className="empty" style={{ gridColumn: '1 / -1' }}>
+                            No columns matching "{selColSearch}".
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Step 3: Row Selection & Filtering */}
+                  <div className="studio-card">
+                    <div className="studio-card-header">
+                      <div className="studio-card-title">
+                        <div className="step-num-badge">3</div>
+                        <div>
+                          <h3>Row Selection & Filtering</h3>
+                          <p>
+                            Type-aware parameterized filters. Identifiers and values are sanitized and passed as bind parameters.
+                          </p>
+                        </div>
+                      </div>
+                      <span className="count-pill">{selFilters.length} Filter(s)</span>
+                    </div>
+
+                    {/* Filter Conjunction Bar */}
+                    <div className="filter-conjunction-bar">
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                        <span style={{ fontSize: 12, color: 'var(--text-secondary)', fontWeight: 600 }}>Logic:</span>
+                        <div className="conjunction-toggle">
+                          <button
+                            type="button"
+                            className={`conjunction-btn ${selConjunction === 'AND' ? 'active' : ''}`}
+                            onClick={() => setSelConjunction('AND')}
+                          >
+                            Match ALL (AND)
+                          </button>
+                          <button
+                            type="button"
+                            className={`conjunction-btn ${selConjunction === 'OR' ? 'active' : ''}`}
+                            onClick={() => setSelConjunction('OR')}
+                          >
+                            Match ANY (OR)
+                          </button>
+                        </div>
+                        <span style={{ fontSize: 11, color: 'var(--text-muted)' }}>
+                          {selConjunction === 'AND'
+                            ? '• Records must satisfy all specified filter rules'
+                            : '• Records matching any filter rule will be returned'}
+                        </span>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: 8 }}>
+                        <button
+                          type="button"
+                          className="button small primary"
+                          onClick={handleAddFilter}
+                          disabled={!selTableDetail || selTableDetail.columns.length === 0}
+                        >
+                          <Plus size={12} /> Add Filter Rule
+                        </button>
+                        {selFilters.length > 0 && (
+                          <button
+                            type="button"
+                            className="button small secondary"
+                            onClick={handleClearAllFilters}
+                          >
+                            Clear All
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Filter Rules List */}
+                    {selFilters.length === 0 ? (
+                      <div className="filter-empty-state">
+                        No filters applied. All rows from <code>{selTable}</code> will be included in the selection. Click{' '}
+                        <strong>"+ Add Filter Rule"</strong> to filter by specific column values.
+                      </div>
+                    ) : (
+                      <div className="filter-rule-list">
+                        {selFilters.map(f => {
+                          const colMeta = selTableDetail?.columns.find(c => c.name === f.column)
+                          const availableOps = getOperatorsForType(colMeta?.data_type || '')
+                          const isNoValueOp = f.operator === 'is_empty' || f.operator === 'is_not_empty'
+                          return (
+                            <div key={f.id} className="filter-rule-item">
+                              {/* Column dropdown */}
+                              <select
+                                className="filter-select"
+                                value={f.column}
+                                onChange={e => handleUpdateFilter(f.id, 'column', e.target.value)}
+                              >
+                                {(selTableDetail?.columns || []).map(col => (
+                                  <option key={col.name} value={col.name}>
+                                    {col.name} ({col.data_type})
+                                  </option>
+                                ))}
+                              </select>
+
+                              {/* Type-appropriate operator dropdown */}
+                              <select
+                                className="filter-select"
+                                value={f.operator}
+                                onChange={e => handleUpdateFilter(f.id, 'operator', e.target.value)}
+                              >
+                                {availableOps.map(op => (
+                                  <option key={op.value} value={op.value}>
+                                    {op.label}
+                                  </option>
+                                ))}
+                              </select>
+
+                              {/* Parameterized Value Input */}
+                              <input
+                                className="filter-input"
+                                placeholder={isNoValueOp ? 'No value needed (checks NULL/blank)' : `Value for ${f.column}…`}
+                                value={f.value}
+                                disabled={isNoValueOp}
+                                onChange={e => handleUpdateFilter(f.id, 'value', e.target.value)}
+                              />
+
+                              {/* Remove rule button */}
+                              <button
+                                type="button"
+                                className="icon-button"
+                                style={{ width: 28, height: 28 }}
+                                onClick={() => handleRemoveFilter(f.id)}
+                                title="Delete filter rule"
+                                aria-label="Delete filter rule"
+                              >
+                                <Trash2 size={13} />
+                              </button>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Step 4: Data Preview */}
+                  <div className="studio-card highlight">
+                    <div className="studio-card-header">
+                      <div className="studio-card-title">
+                        <div className="step-num-badge">4</div>
+                        <div>
+                          <h3>Data Preview</h3>
+                          <p>
+                            {selQueryResult
+                              ? `Previewing ${selQueryResult.rows.length} of ${selQueryResult.total_matching} matching record(s) with ${selQueryResult.columns.length} selected column(s)`
+                              : 'Click "Preview Data" to run the parameterized query against Supabase.'}
+                          </p>
+                        </div>
+                      </div>
+                      <div style={{ display: 'flex', gap: 6 }}>
+                        <button
+                          className="button primary small"
+                          onClick={() => void handleExecuteQuery()}
+                          disabled={selQuerying || selColumns.length === 0}
+                        >
+                          {selQuerying ? (
+                            <>
+                              <RefreshCw size={12} className="spinning" /> Loading…
+                            </>
+                          ) : (
+                            <>
+                              <Play size={12} /> Preview Data
+                            </>
+                          )}
+                        </button>
+                        {selQueryResult && selQueryResult.rows.length > 0 && (
+                          <button
+                            className="button secondary small"
+                            onClick={() => exportToExcelCSV(selTable, selColumns, selQueryResult.rows)}
+                            title="Export to CSV / Excel"
+                          >
+                            <FileSpreadsheet size={12} /> Excel CSV
+                          </button>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Preview Table */}
+                    {selQuerying ? (
+                      <div className="empty" style={{ padding: 40 }}>
+                        <RefreshCw size={24} className="spinning" style={{ color: 'var(--accent)' }} />
+                        <div style={{ marginTop: 12, fontWeight: 600 }}>Executing parameterized query…</div>
+                      </div>
+                    ) : !selQueryResult ? (
+                      <div className="detail-empty" style={{ padding: 32 }}>
+                        <div className="empty-icon">
+                          <Table2 size={24} />
+                        </div>
+                        <h2>No preview generated yet</h2>
+                        <p>
+                          Configure your desired columns and optional filters above, then click <strong>"Preview Data"</strong>.
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        <div className="data-note" style={{ display: 'flex', justifyContent: 'space-between' }}>
+                          <span>
+                            Table: <code>{selQueryResult.table}</code> · Total matched in database:{' '}
+                            <strong>{selQueryResult.total_matching} rows</strong>
+                          </span>
+                          <span>Columns: {selQueryResult.columns.join(', ')}</span>
+                        </div>
+
+                        <div className="data-table-wrap">
+                          <table>
+                            <thead>
+                              <tr>
+                                {selQueryResult.columns.map(c => (
+                                  <th key={c}>
+                                    <span style={{ fontFamily: 'var(--font-mono)' }}>{c}</span>
+                                  </th>
+                                ))}
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {selQueryResult.rows.map((row, idx) => (
+                                <tr key={idx}>
+                                  {selQueryResult.columns.map(col => {
+                                    const val = row[col]
+                                    return (
+                                      <td key={col}>
+                                        {val === null || val === undefined ? (
+                                          <em style={{ color: 'var(--text-muted)' }}>NULL</em>
+                                        ) : typeof val === 'boolean' ? (
+                                          <span className={val ? 'pill primary' : 'pill neutral'}>
+                                            {val ? 'TRUE' : 'FALSE'}
+                                          </span>
+                                        ) : (
+                                          String(val)
+                                        )}
+                                      </td>
+                                    )
+                                  })}
+                                </tr>
+                              ))}
+                              {selQueryResult.rows.length === 0 && (
+                                <tr>
+                                  <td
+                                    colSpan={selQueryResult.columns.length || 1}
+                                    style={{ textAlign: 'center', padding: 32, color: 'var(--text-muted)' }}
+                                  >
+                                    No records matched your filter criteria in schema '{schema}'.
+                                  </td>
+                                </tr>
+                              )}
+                            </tbody>
+                          </table>
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* ─── Save Configuration Modal ─── */}
+              {showSaveModal && (
+                <div className="api-modal-backdrop" onClick={() => setShowSaveModal(false)}>
+                  <div
+                    className="api-modal"
+                    onClick={e => e.stopPropagation()}
+                    role="dialog"
+                    aria-labelledby="save-modal-title"
+                  >
+                    <div className="api-modal-header">
+                      <div className="api-modal-title">
+                        <div className="provider-icon" style={{ background: 'var(--accent-muted)', color: 'var(--accent)' }}>
+                          <Bookmark size={18} />
+                        </div>
+                        <div>
+                          <h3 id="save-modal-title">Save Data Selection</h3>
+                          <p>Save this table, column projection, and filter configuration for instant reuse.</p>
+                        </div>
+                      </div>
+                      <button className="icon-button" onClick={() => setShowSaveModal(false)} aria-label="Close modal">
+                        <X size={16} />
+                      </button>
+                    </div>
+
+                    <div className="api-modal-body">
+                      <div className="conn-field">
+                        <label>
+                          <span>Selection Name</span>
+                        </label>
+                        <input
+                          className="conn-input"
+                          placeholder="e.g. Completed Orders with Customer Emails"
+                          value={saveNameInput}
+                          onChange={e => setSaveNameInput(e.target.value)}
+                          autoFocus
+                        />
+                      </div>
+
+                      <div className="conn-field">
+                        <label>
+                          <span>Description (Optional)</span>
+                        </label>
+                        <input
+                          className="conn-input"
+                          placeholder="e.g. Filters high-value customer orders"
+                          value={saveDescInput}
+                          onChange={e => setSaveDescInput(e.target.value)}
+                        />
+                      </div>
+
+                      <div
+                        style={{
+                          background: 'var(--bg-surface-0)',
+                          border: '1px solid var(--border-subtle)',
+                          borderRadius: 'var(--radius-md)',
+                          padding: 12,
+                          fontSize: 12,
+                          display: 'flex',
+                          flexDirection: 'column',
+                          gap: 6
+                        }}
+                      >
+                        <div>
+                          <strong>Table:</strong> <code>{selTable}</code> (Schema: {schema})
+                        </div>
+                        <div>
+                          <strong>Selected Columns ({selColumns.length}):</strong> {selColumns.join(', ')}
+                        </div>
+                        <div>
+                          <strong>Filters ({selFilters.length}):</strong>{' '}
+                          {selFilters.length === 0
+                            ? 'None (all rows)'
+                            : selFilters.map(f => `${f.column} ${f.operator} "${f.value}"`).join(` ${selConjunction} `)}
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="api-modal-footer">
+                      <button className="button secondary" onClick={() => setShowSaveModal(false)}>
+                        Cancel
+                      </button>
+                      <button
+                        className="button primary"
+                        onClick={() => void handleSaveSelection()}
+                        disabled={!saveNameInput.trim()}
+                      >
+                        <Check size={14} /> Save Configuration
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

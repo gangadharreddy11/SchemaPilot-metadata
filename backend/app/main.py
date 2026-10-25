@@ -1,4 +1,7 @@
+import json
 import os
+import uuid
+from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -7,9 +10,22 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sqlalchemy import MetaData, Table, create_engine, inspect, select, text
+from sqlalchemy import (
+    MetaData,
+    String,
+    Table,
+    and_,
+    cast,
+    create_engine,
+    func,
+    inspect,
+    or_,
+    select,
+    text,
+)
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.exc import SQLAlchemyError
+
 
 # Locate directories to reliably find .env regardless of working directory
 CURRENT_FILE = Path(__file__).resolve()
@@ -202,10 +218,52 @@ def table_names(schema: str | None = None) -> list[str]:
     return sorted(insp.get_table_names(schema=target_schema))
 
 
-def validate_table(table_name: str, schema: str | None) -> None:
-    target_schema = resolve_schema(schema)
-    if table_name not in table_names(target_schema):
-        raise HTTPException(status_code=404, detail="Table not found in the selected schema.")
+def resolve_table_schema(table_name: str, schema: str | None = None) -> str:
+    """
+    Intelligently find the schema containing table_name.
+    1. Checks the specified schema first.
+    2. If not found, checks default schema ('public' on PostgreSQL).
+    3. If still not found, searches all visible schemas.
+    4. Only raises 404 if table cannot be found anywhere in the connected database.
+    """
+    target = resolve_schema(schema)
+    insp = get_inspector()
+
+    # 1. Check target schema
+    try:
+        if table_name in insp.get_table_names(schema=target):
+            return target
+    except Exception:
+        pass
+
+    # 2. Check default schema
+    def_schema = get_default_schema()
+    if def_schema and def_schema != target:
+        try:
+            if table_name in insp.get_table_names(schema=def_schema):
+                return def_schema
+        except Exception:
+            pass
+
+    # 3. Search all schema names
+    try:
+        all_schemas = insp.get_schema_names()
+        for s in all_schemas:
+            if s not in (target, def_schema):
+                try:
+                    if table_name in insp.get_table_names(schema=s):
+                        return s
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    raise HTTPException(status_code=404, detail=f"Table '{table_name}' not found in the selected schema.")
+
+
+def validate_table(table_name: str, schema: str | None = None) -> str:
+    return resolve_table_schema(table_name, schema)
+
 
 
 class ConnectionPayload(BaseModel):
@@ -412,9 +470,8 @@ def list_tables(schema: str = Query(default="public")) -> dict[str, Any]:
 
 @app.get("/api/tables/{table_name}/metadata")
 def table_metadata(table_name: str, schema: str = Query(default="public")) -> dict[str, Any]:
-    target_schema = resolve_schema(schema)
     try:
-        validate_table(table_name, target_schema)
+        target_schema = resolve_table_schema(table_name, schema)
         insp = get_inspector()
         columns = insp.get_columns(table_name, schema=target_schema)
         pk = insp.get_pk_constraint(table_name, schema=target_schema) or {}
@@ -422,6 +479,7 @@ def table_metadata(table_name: str, schema: str = Query(default="public")) -> di
         indexes = insp.get_indexes(table_name, schema=target_schema)
         uniques = safe_get_unique_constraints(insp, table_name, target_schema)
         checks = safe_get_check_constraints(insp, table_name, target_schema)
+
         pk_columns = set(pk.get("constrained_columns") or [])
         fk_columns = {col for fk in fks for col in (fk.get("constrained_columns") or [])}
         unique_columns = {col for item in uniques for col in (item.get("column_names") or [])}
@@ -456,6 +514,22 @@ def table_metadata(table_name: str, schema: str = Query(default="public")) -> di
         raise HTTPException(status_code=502, detail=f"Unable to retrieve table metadata: {sanitize_error(exc)}")
 
 
+def safe_value(value: Any) -> Any:
+    """Normalize any database types for JSON serialization."""
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, Decimal):
+        return float(value)
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    if isinstance(value, (bytes, bytearray)):
+        try:
+            return value.decode("utf-8")
+        except Exception:
+            return value.hex()
+    return str(value)
+
+
 @app.get("/api/tables/{table_name}/rows")
 def table_rows(
     table_name: str,
@@ -464,28 +538,14 @@ def table_rows(
     offset: int = Query(default=0, ge=0),
 ) -> dict[str, Any]:
     """Read-only, paginated preview. This endpoint does not perform writes."""
-    target_schema = resolve_schema(schema)
     try:
-        validate_table(table_name, target_schema)
+        target_schema = resolve_table_schema(table_name, schema)
         metadata = MetaData()
         table = Table(table_name, metadata, schema=target_schema, autoload_with=engine)
+
         stmt = select(table).limit(limit).offset(offset)
         with engine.connect() as conn:
             rows = conn.execute(stmt).mappings().all()
-
-        def safe_value(value):
-            if value is None or isinstance(value, (str, int, float, bool)):
-                return value
-            if isinstance(value, Decimal):
-                return float(value)
-            if hasattr(value, "isoformat"):
-                return value.isoformat()
-            if isinstance(value, (bytes, bytearray)):
-                try:
-                    return value.decode("utf-8")
-                except Exception:
-                    return value.hex()
-            return str(value)
 
         return {
             "schema": target_schema,
@@ -499,3 +559,259 @@ def table_rows(
         raise
     except SQLAlchemyError as exc:
         raise HTTPException(status_code=502, detail=f"Unable to retrieve rows: {sanitize_error(exc)}")
+
+
+class FilterRule(BaseModel):
+    column: str
+    operator: str
+    value: Any = None
+
+
+class DataQueryPayload(BaseModel):
+    schema_name: str | None = None
+    table: str
+    columns: list[str]
+    filters: list[FilterRule] = []
+    conjunction: str = "AND"
+    limit: int = 50
+    offset: int = 0
+    sort_column: str | None = None
+    sort_direction: str = "asc"
+
+
+class SavedSelectionPayload(BaseModel):
+    id: str | None = None
+    name: str
+    description: str | None = None
+    schema_name: str
+    table: str
+    columns: list[str]
+    filters: list[FilterRule] = []
+    conjunction: str = "AND"
+    created_at: str | None = None
+
+
+SAVED_SELECTIONS_FILE = BACKEND_DIR / "saved_selections.json"
+
+DEFAULT_SELECTIONS = [
+    {
+        "id": "preset-1",
+        "name": 'Customers with "Ravi"',
+        "description": "Filters customers whose name contains Ravi",
+        "schema_name": "public",
+        "table": "customers",
+        "columns": ["customer_id", "name", "email", "created_at"],
+        "filters": [{"column": "name", "operator": "contains", "value": "Ravi"}],
+        "conjunction": "AND",
+        "created_at": "2026-01-01T00:00:00Z"
+    },
+    {
+        "id": "preset-2",
+        "name": "Completed Payments",
+        "description": "All payments with payment_status = 'completed'",
+        "schema_name": "public",
+        "table": "payments",
+        "columns": ["payment_id", "order_id", "amount", "payment_method", "payment_status", "paid_at"],
+        "filters": [{"column": "payment_status", "operator": "equals", "value": "completed"}],
+        "conjunction": "AND",
+        "created_at": "2026-01-01T00:00:00Z"
+    },
+    {
+        "id": "preset-3",
+        "name": "High Value Products (> 100)",
+        "description": "Products with unit price greater than 100",
+        "schema_name": "public",
+        "table": "products",
+        "columns": ["product_id", "name", "price", "stock"],
+        "filters": [{"column": "price", "operator": "greater_than", "value": 100}],
+        "conjunction": "AND",
+        "created_at": "2026-01-01T00:00:00Z"
+    }
+]
+
+
+def load_saved_selections_from_disk() -> list[dict[str, Any]]:
+    if not SAVED_SELECTIONS_FILE.is_file():
+        try:
+            SAVED_SELECTIONS_FILE.write_text(json.dumps(DEFAULT_SELECTIONS, indent=2), encoding="utf-8")
+        except Exception:
+            return DEFAULT_SELECTIONS
+        return DEFAULT_SELECTIONS
+    try:
+        content = SAVED_SELECTIONS_FILE.read_text(encoding="utf-8")
+        return json.loads(content)
+    except Exception:
+        return DEFAULT_SELECTIONS
+
+
+def save_saved_selections_to_disk(items: list[dict[str, Any]]) -> None:
+    try:
+        SAVED_SELECTIONS_FILE.write_text(json.dumps(items, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+@app.post("/api/query")
+def execute_data_query(payload: DataQueryPayload) -> dict[str, Any]:
+    """
+    Safely executes filtered queries with parameterized values and explicit column selection.
+    Validates table, columns, and operators against actual database metadata.
+    """
+    try:
+        target_schema = resolve_table_schema(payload.table, payload.schema_name)
+        metadata = MetaData()
+        table = Table(payload.table, metadata, schema=target_schema, autoload_with=engine)
+
+        # Filter to columns that actually exist in the table; fallback to first 4 if none match
+        valid_cols = [c for c in payload.columns if c in table.c]
+        if not valid_cols:
+            valid_cols = [c.name for c in table.columns][:4] or [c.name for c in table.columns]
+
+        if not valid_cols:
+            raise HTTPException(status_code=400, detail="At least one column must be selected.")
+
+        selected_col_objs = [table.c[col] for col in valid_cols]
+
+
+        # Build parameterized filter conditions
+        conditions = []
+        for f in payload.filters:
+            col_name = f.column.strip()
+            if not col_name or col_name not in table.c:
+                continue
+
+            col_c = table.c[col_name]
+            op = (f.operator or "equals").strip().lower()
+            val = f.value
+
+            # Attempt numeric conversion if applicable
+            type_str = str(col_c.type).upper()
+            is_numeric = any(t in type_str for t in ("INT", "NUMERIC", "DECIMAL", "FLOAT", "DOUBLE", "REAL"))
+
+            parsed_val = val
+            if is_numeric and val is not None and isinstance(val, str):
+                try:
+                    if "." in val:
+                        parsed_val = float(val)
+                    else:
+                        parsed_val = int(val)
+                except ValueError:
+                    parsed_val = val
+
+            if op in ("equals", "eq", "="):
+                conditions.append(col_c == parsed_val)
+            elif op in ("not_equals", "neq", "!="):
+                conditions.append(col_c != parsed_val)
+            elif op in ("contains", "like"):
+                conditions.append(cast(col_c, String).ilike(f"%{parsed_val}%"))
+            elif op in ("starts_with", "startswith"):
+                conditions.append(cast(col_c, String).ilike(f"{parsed_val}%"))
+            elif op in ("ends_with", "endswith"):
+                conditions.append(cast(col_c, String).ilike(f"%{parsed_val}"))
+            elif op in ("greater_than", "gt", ">"):
+                conditions.append(col_c > parsed_val)
+            elif op in ("less_than", "lt", "<"):
+                conditions.append(col_c < parsed_val)
+            elif op in ("greater_than_or_equal", "gte", ">="):
+                conditions.append(col_c >= parsed_val)
+            elif op in ("less_than_or_equal", "lte", "<="):
+                conditions.append(col_c <= parsed_val)
+            elif op in ("is_empty", "isempty"):
+                conditions.append(or_(col_c.is_(None), cast(col_c, String) == ""))
+            elif op in ("is_not_empty", "isnotempty"):
+                conditions.append(and_(col_c.is_not(None), cast(col_c, String) != ""))
+            elif op in ("is_null", "isnull"):
+                conditions.append(col_c.is_(None))
+            elif op in ("is_not_null", "isnotnull"):
+                conditions.append(col_c.is_not(None))
+
+        # Combine with requested conjunction (AND or OR)
+        where_clause = None
+        if conditions:
+            if payload.conjunction.strip().upper() == "OR":
+                where_clause = or_(*conditions)
+            else:
+                where_clause = and_(*conditions)
+
+        # Count total matching rows
+        count_stmt = select(func.count()).select_from(table)
+        if where_clause is not None:
+            count_stmt = count_stmt.where(where_clause)
+
+        # Build data selection statement
+        stmt = select(*selected_col_objs)
+        if where_clause is not None:
+            stmt = stmt.where(where_clause)
+
+        # Optional sorting
+        if payload.sort_column and payload.sort_column in table.c:
+            sort_c = table.c[payload.sort_column]
+            if payload.sort_direction.lower() == "desc":
+                stmt = stmt.order_by(sort_c.desc())
+            else:
+                stmt = stmt.order_by(sort_c.asc())
+
+        clamped_limit = max(1, min(payload.limit, 500))
+        clamped_offset = max(0, payload.offset)
+        stmt = stmt.limit(clamped_limit).offset(clamped_offset)
+
+        with engine.connect() as conn:
+            total_matching = conn.execute(count_stmt).scalar() or 0
+            rows = conn.execute(stmt).mappings().all()
+
+        return {
+            "schema": target_schema,
+            "table": payload.table,
+            "columns": valid_cols,
+            "total_matching": total_matching,
+
+            "limit": clamped_limit,
+            "offset": clamped_offset,
+            "rows": [{k: safe_value(v) for k, v in row.items()} for row in rows],
+        }
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Query execution failed: {sanitize_error(exc)}")
+
+
+@app.get("/api/saved-selections")
+def get_saved_selections() -> dict[str, Any]:
+    """Retrieve all saved data selections."""
+    items = load_saved_selections_from_disk()
+    return {"selections": items}
+
+
+@app.post("/api/saved-selections")
+def save_data_selection(payload: SavedSelectionPayload) -> dict[str, Any]:
+    """Save or update a data selection configuration."""
+    items = load_saved_selections_from_disk()
+    item_id = payload.id or str(uuid.uuid4())
+    now_iso = datetime.utcnow().isoformat() + "Z"
+
+    entry = {
+        "id": item_id,
+        "name": payload.name.strip() or f"Selection on {payload.table}",
+        "description": payload.description or "",
+        "schema_name": payload.schema_name or "public",
+        "table": payload.table,
+        "columns": payload.columns,
+        "filters": [f.model_dump() for f in payload.filters],
+        "conjunction": payload.conjunction or "AND",
+        "created_at": payload.created_at or now_iso,
+    }
+
+    # Replace existing or prepend new
+    updated = [entry] + [x for x in items if x.get("id") != item_id]
+    save_saved_selections_to_disk(updated)
+    return {"ok": True, "selection": entry}
+
+
+@app.delete("/api/saved-selections/{selection_id}")
+def delete_saved_selection(selection_id: str) -> dict[str, Any]:
+    """Delete a saved data selection."""
+    items = load_saved_selections_from_disk()
+    filtered_items = [x for x in items if x.get("id") != selection_id]
+    save_saved_selections_to_disk(filtered_items)
+    return {"ok": True, "message": f"Selection '{selection_id}' removed."}
+

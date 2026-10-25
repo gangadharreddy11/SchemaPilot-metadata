@@ -1,0 +1,17 @@
+[
+  {
+    "id": "1792934425399",
+    "name": "gangadhar",
+    "description": "",
+    "schema_name": "public",
+    "table": "customers",
+    "columns": [
+      "customer_id",
+      "name",
+      "email"
+    ],
+    "filters": [],
+    "conjunction": "AND",
+    "created_at": "2026-10-25T13:20:25.399Z"
+  }
+]
