@@ -432,7 +432,7 @@ function App() {
 
   // Connection management state
   const [currentConn, setCurrentConn] = useState<ConnectionInfo | null>(null)
-  const [selectedProvider, setSelectedProvider] = useState<ProviderType>('mysql')
+  const [selectedProvider, setSelectedProvider] = useState<ProviderType>('postgres')
   const [dbUrlInput, setDbUrlInput] = useState('')
   const [connNickName, setConnNickName] = useState('')
   const [testing, setTesting] = useState(false)
@@ -447,9 +447,9 @@ function App() {
     return [
       {
         id: '1',
-        name: 'Local MySQL',
-        provider: 'mysql',
-        url: 'mysql+pymysql://root:Jai%401432@localhost:3306/schemapilot'
+        name: 'PostgreSQL (Default)',
+        provider: 'postgres',
+        url: 'postgresql+psycopg2://postgres:password@localhost:5432/postgres'
       }
     ]
   })
