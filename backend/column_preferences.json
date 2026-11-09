@@ -1,0 +1,16 @@
+{
+  "schemapilot.customers": {
+    "selected": [
+      "customer_id",
+      "name"
+    ],
+    "known": [
+      "customer_id",
+      "name",
+      "email",
+      "created_at",
+      "jai",
+      "jai1"
+    ]
+  }
+}

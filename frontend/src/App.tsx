@@ -9,9 +9,11 @@ import {
   ChevronDown,
   ChevronRight,
   CircleHelp,
+  Columns,
   Copy,
   Database,
   Download,
+  Edit,
   ExternalLink,
   FileSpreadsheet,
   Filter,
@@ -35,6 +37,18 @@ import {
   Trash2,
   X
 } from 'lucide-react'
+import {
+  ConfirmDialog,
+  CreateTableModal,
+  RenameTableModal,
+  AddColumnModal,
+  EditColumnModal,
+  RenameColumnModal,
+  AddRowModal,
+  EditRowModal,
+  ViewTableStructureModal
+} from './CrudModals'
+import './crud-styles.css'
 
 const DEFAULT_API = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '')
 
@@ -440,6 +454,27 @@ function App() {
     ]
   })
 
+  // ─── Explorer Column Selection & Preferences State (Features 1 & 2) ───
+  const [explorerSelectedCols, setExplorerSelectedCols] = useState<string[]>([])
+  const [prefsDebounceTimer, setPrefsDebounceTimer] = useState<ReturnType<typeof setTimeout> | null>(null)
+
+  // ─── Explorer CRUD Modals State (Features 3, 4, 5) ───
+  const [showCreateTable, setShowCreateTable] = useState(false)
+  const [showRenameTable, setShowRenameTable] = useState(false)
+  const [showDeleteTableConfirm, setShowDeleteTableConfirm] = useState(false)
+  const [showViewStructure, setShowViewStructure] = useState(false)
+
+  const [showAddColumn, setShowAddColumn] = useState(false)
+  const [showEditColumn, setShowEditColumn] = useState<ColumnInfo | null>(null)
+  const [showRenameColumn, setShowRenameColumn] = useState<ColumnInfo | null>(null)
+  const [showDeleteColumnConfirm, setShowDeleteColumnConfirm] = useState<ColumnInfo | null>(null)
+
+  const [showAddRow, setShowAddRow] = useState(false)
+  const [showEditRow, setShowEditRow] = useState<Record<string, unknown> | null>(null)
+  const [showDeleteRowConfirm, setShowDeleteRowConfirm] = useState<Record<string, unknown> | null>(null)
+  const [crudLoading, setCrudLoading] = useState(false)
+  const [crudError, setCrudError] = useState('')
+
   useEffect(() => {
     try {
       localStorage.setItem('schemapilot_saved_connections', JSON.stringify(savedConnections))
@@ -466,6 +501,20 @@ function App() {
     const base = apiUrl.replace(/\/+$/, '')
     const response = await fetch(`${base}${path}`, {
       method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    })
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}))
+      throw new Error(body.detail || `Request failed (${response.status})`)
+    }
+    return response.json() as Promise<T>
+  }
+
+  async function putJson<T>(path: string, payload: unknown): Promise<T> {
+    const base = apiUrl.replace(/\/+$/, '')
+    const response = await fetch(`${base}${path}`, {
+      method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     })
@@ -561,7 +610,14 @@ function App() {
         setDetail(null)
         setRows(null)
       } else if (!selected && tableData.tables.length > 0) {
-        void openTable(tableData.tables[0].name, nextSchema)
+        let toOpen = tableData.tables[0].name
+        try {
+          const last = localStorage.getItem('schemapilot_last_table')
+          if (last && tableData.tables.some(t => t.name === last)) {
+            toOpen = last
+          }
+        } catch {}
+        void openTable(toOpen, nextSchema)
       }
       void loadCurrentConnection()
     } catch (e) {
@@ -576,12 +632,48 @@ function App() {
     setOffset(0)
     setError('')
     try {
+      localStorage.setItem('schemapilot_last_table', name)
+    } catch {}
+    try {
       const [meta, data] = await Promise.all([
         getJson<Detail>(`/api/tables/${encodeURIComponent(name)}/metadata?schema=${encodeURIComponent(tableSchema)}`),
         getJson<Rows>(`/api/tables/${encodeURIComponent(name)}/rows?schema=${encodeURIComponent(tableSchema)}&limit=25&offset=0`)
       ])
       setDetail(meta)
       setRows(data)
+
+      const allColNames = meta.columns.map(c => c.name)
+      let activeCols = allColNames
+
+      // Try fetching saved column preferences from backend (Feature 2)
+      // The backend tracks both "selected" and "known" columns, so newly
+      // added columns are automatically included as checked.
+      try {
+        const prefRes = await getJson<{ selected_columns?: string[] }>(
+          `/api/preferences/columns?table=${encodeURIComponent(name)}&schema=${encodeURIComponent(tableSchema)}`
+        )
+        if (prefRes && Array.isArray(prefRes.selected_columns)) {
+          activeCols = prefRes.selected_columns.filter(c => allColNames.includes(c))
+        }
+      } catch {
+        // Backend unavailable – fall back to localStorage
+        try {
+          const stored = localStorage.getItem(`schemapilot_col_prefs_${tableSchema}_${name}`)
+          if (stored) {
+            const parsed = JSON.parse(stored)
+            if (parsed && Array.isArray(parsed.selected)) {
+              const valid = (parsed.selected as string[]).filter(c => allColNames.includes(c))
+              const known = Array.isArray(parsed.known) ? (parsed.known as string[]) : []
+              const newCols = allColNames.filter(c => !known.includes(c))
+              activeCols = [...valid, ...newCols]
+            } else if (Array.isArray(parsed)) {
+              activeCols = parsed.filter(c => allColNames.includes(c))
+            }
+          }
+        } catch {}
+      }
+
+      setExplorerSelectedCols(activeCols)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not load table details')
     }
@@ -597,6 +689,183 @@ function App() {
       setOffset(nextOffset)
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not load rows')
+    }
+  }
+
+  // ─── Column Selection & Preferences Handlers (Features 1 & 2) ───
+  function handleExplorerToggleCol(colName: string) {
+    if (!selected || !detail) return
+    const next = explorerSelectedCols.includes(colName)
+      ? explorerSelectedCols.filter(c => c !== colName)
+      : [...explorerSelectedCols, colName]
+
+    setExplorerSelectedCols(next)
+
+    const allColNames = detail.columns.map(c => c.name)
+
+    // Save to localStorage immediately
+    try {
+      localStorage.setItem(
+        `schemapilot_col_prefs_${schema}_${selected}`,
+        JSON.stringify({ selected: next, known: allColNames })
+      )
+    } catch {}
+
+    // Debounced save to backend
+    if (prefsDebounceTimer) clearTimeout(prefsDebounceTimer)
+    const t = setTimeout(async () => {
+      try {
+        await postJson('/api/preferences/columns', {
+          table: selected,
+          schema_name: schema,
+          selected_columns: next
+        })
+      } catch {}
+    }, 400)
+    setPrefsDebounceTimer(t)
+  }
+
+  function handleExplorerSelectAll() {
+    if (!detail || !selected) return
+    const all = detail.columns.map(c => c.name)
+    setExplorerSelectedCols(all)
+    try {
+      localStorage.setItem(
+        `schemapilot_col_prefs_${schema}_${selected}`,
+        JSON.stringify({ selected: all, known: all })
+      )
+    } catch {}
+    if (prefsDebounceTimer) clearTimeout(prefsDebounceTimer)
+    const t = setTimeout(async () => {
+      try {
+        await postJson('/api/preferences/columns', {
+          table: selected,
+          schema_name: schema,
+          selected_columns: all
+        })
+      } catch {}
+    }, 400)
+    setPrefsDebounceTimer(t)
+  }
+
+  function handleExplorerClearAll() {
+    if (!detail || !selected) return
+    const all = detail.columns.map(c => c.name)
+    setExplorerSelectedCols([])
+    try {
+      localStorage.setItem(
+        `schemapilot_col_prefs_${schema}_${selected}`,
+        JSON.stringify({ selected: [], known: all })
+      )
+    } catch {}
+    if (prefsDebounceTimer) clearTimeout(prefsDebounceTimer)
+    const t = setTimeout(async () => {
+      try {
+        await postJson('/api/preferences/columns', {
+          table: selected,
+          schema_name: schema,
+          selected_columns: []
+        })
+      } catch {}
+    }, 400)
+    setPrefsDebounceTimer(t)
+  }
+
+  // ─── CRUD Action Handlers (Features 3, 4, 5) ───
+  async function handleCrudSuccess(reopenTable?: string) {
+    await loadInventory()
+    const target = reopenTable || selected
+    if (target) {
+      await openTable(target)
+    }
+  }
+
+  async function handleDeleteTable() {
+    if (!selected) return
+    setCrudLoading(true)
+    setCrudError('')
+    try {
+      const base = apiUrl.replace(/\/+$/, '')
+      const res = await fetch(`${base}/api/tables/${encodeURIComponent(selected)}?schema=${encodeURIComponent(schema)}`, {
+        method: 'DELETE'
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.detail || `Delete table failed (${res.status})`)
+      }
+      setShowDeleteTableConfirm(false)
+      const dropped = selected
+      setSelected('')
+      setDetail(null)
+      setRows(null)
+      setSuccessMsg(`Table "${dropped}" was deleted successfully.`)
+      await loadInventory()
+    } catch (e) {
+      setCrudError(e instanceof Error ? e.message : 'Delete table failed')
+    } finally {
+      setCrudLoading(false)
+    }
+  }
+
+  async function handleDeleteColumn(colName: string) {
+    if (!selected) return
+    setCrudLoading(true)
+    setCrudError('')
+    try {
+      const base = apiUrl.replace(/\/+$/, '')
+      const res = await fetch(
+        `${base}/api/tables/${encodeURIComponent(selected)}/columns/${encodeURIComponent(colName)}?schema=${encodeURIComponent(schema)}`,
+        { method: 'DELETE' }
+      )
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.detail || `Delete column failed (${res.status})`)
+      }
+      setShowDeleteColumnConfirm(null)
+      setSuccessMsg(`Column "${colName}" was deleted from "${selected}".`)
+      await handleCrudSuccess()
+    } catch (e) {
+      setCrudError(e instanceof Error ? e.message : 'Delete column failed')
+    } finally {
+      setCrudLoading(false)
+    }
+  }
+
+  async function handleDeleteRow(row: Record<string, unknown>) {
+    if (!selected || !detail) return
+    const pkCols = (detail.primary_key?.constrained_columns || []) as string[]
+    if (pkCols.length === 0) {
+      setCrudError('Cannot delete: table has no primary key constraint.')
+      return
+    }
+    const pkValues: Record<string, unknown> = {}
+    pkCols.forEach(pk => {
+      pkValues[pk] = row[pk]
+    })
+
+    setCrudLoading(true)
+    setCrudError('')
+    try {
+      const base = apiUrl.replace(/\/+$/, '')
+      const res = await fetch(`${base}/api/tables/${encodeURIComponent(selected)}/records`, {
+        method: 'DELETE',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          schema_name: schema,
+          primary_key: pkValues
+        })
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        throw new Error(body.detail || `Delete record failed (${res.status})`)
+      }
+      setShowDeleteRowConfirm(null)
+      setSuccessMsg('Record deleted successfully.')
+      await handleCrudSuccess()
+    } catch (e) {
+      setCrudError(e instanceof Error ? e.message : 'Delete record failed')
+    } finally {
+      setCrudLoading(false)
     }
   }
 
@@ -987,8 +1256,8 @@ function App() {
             <ShieldCheck size={16} />
           </div>
           <div>
-            <strong>Read-only explorer</strong>
-            <span>Metadata & row preview</span>
+            <strong>Database Management</strong>
+            <span>Full CRUD operations</span>
           </div>
         </div>
       </aside>
@@ -2213,7 +2482,16 @@ function App() {
                         {tables.length} tables in <b>{schema}</b>
                       </p>
                     </div>
-                    <span className="count-pill">{filtered.length}</span>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                      <button
+                        className="button small primary"
+                        onClick={() => setShowCreateTable(true)}
+                        title="Create a new table"
+                      >
+                        <Plus size={12} /> Create Table
+                      </button>
+                      <span className="count-pill">{filtered.length}</span>
+                    </div>
                   </div>
                   <div className="search-box">
                     <Search size={15} />
@@ -2271,7 +2549,7 @@ function App() {
                     </div>
                   ) : (
                     <>
-                      <div className="detail-title">
+                      <div className="detail-title" style={{ flexWrap: 'wrap', gap: 10 }}>
                         <div className="table-symbol large" aria-hidden="true">
                           <Table2 size={18} />
                         </div>
@@ -2281,10 +2559,40 @@ function App() {
                             {detail.schema} <ChevronRight size={11} /> Table metadata
                           </span>
                         </div>
+                        <div className="crud-action-bar">
+                          <button
+                            className="button small secondary"
+                            onClick={() => setShowViewStructure(true)}
+                            title="View table structure & constraints"
+                          >
+                            <Database size={12} /> Structure
+                          </button>
+                          <button
+                            className="button small secondary"
+                            onClick={() => setShowRenameTable(true)}
+                            title="Rename this table"
+                          >
+                            <Edit size={12} /> Rename
+                          </button>
+                          <button
+                            className="button small secondary danger-button"
+                            onClick={() => setShowDeleteTableConfirm(true)}
+                            title="Delete this table"
+                          >
+                            <Trash2 size={12} /> Delete Table
+                          </button>
+                        </div>
                         <span className="object-badge">TABLE</span>
                       </div>
                       <div className="detail-stats">
-                        <MiniStat label="Columns" value={detail.column_count} />
+                        <MiniStat
+                          label="Columns"
+                          value={
+                            explorerSelectedCols.length < detail.column_count
+                              ? `${explorerSelectedCols.length} / ${detail.column_count}`
+                              : detail.column_count
+                          }
+                        />
                         <MiniStat label="Primary key columns" value={detail.primary_key?.constrained_columns?.length ?? 0} />
                         <MiniStat label="Foreign keys" value={detail.foreign_keys.length} />
                         <MiniStat label="Indexes" value={detail.indexes.length} />
@@ -2304,44 +2612,145 @@ function App() {
                       </div>
                       <div className="detail-body" role="tabpanel">
                         {tab === 'Columns' && (
-                          <div className="data-table-wrap">
-                            <table>
-                              <thead>
-                                <tr>
-                                  <th>Column</th>
-                                  <th>Data Type</th>
-                                  <th>Nullable</th>
-                                  <th>Properties</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                {detail.columns.map(c => (
-                                  <tr key={c.name}>
-                                    <td>
-                                      <strong>{c.name}</strong>
-                                      <small>#{c.ordinal_position}</small>
-                                    </td>
-                                    <td>
-                                      <code>{c.data_type}</code>
-                                    </td>
-                                    <td>
-                                      <span className={c.nullable ? 'pill neutral' : 'pill required'}>
-                                        {c.nullable ? 'YES' : 'NO'}
-                                      </span>
-                                    </td>
-                                    <td>
-                                      <div className="tag-list">
-                                        {c.primary_key && <span className="pill primary">PK</span>}
-                                        {c.foreign_key && <span className="pill foreign">FK</span>}
-                                        {c.unique && <span className="pill unique">UNIQUE</span>}
-                                        {c.default !== null && <span className="pill neutral">DEFAULT</span>}
-                                      </div>
-                                    </td>
-                                  </tr>
-                                ))}
-                              </tbody>
-                            </table>
-                          </div>
+                          <>
+                            {/* Feature 1 & 2: Dynamic Column Selection Toolbar */}
+                            <div className="explorer-column-toolbar">
+                              <div className="explorer-column-toolbar-top">
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                  <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)' }}>
+                                    Display Columns:
+                                  </span>
+                                  <span className="count-pill" style={{ fontSize: 10 }}>
+                                    {explorerSelectedCols.length} / {detail.columns.length} Checked
+                                  </span>
+                                </div>
+                                <div style={{ display: 'flex', gap: 6 }}>
+                                  <button
+                                    type="button"
+                                    className="button small secondary"
+                                    onClick={handleExplorerSelectAll}
+                                  >
+                                    Select All
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="button small secondary"
+                                    onClick={handleExplorerClearAll}
+                                    disabled={explorerSelectedCols.length === 0}
+                                  >
+                                    Clear All
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="explorer-column-checkboxes">
+                                {detail.columns.map(c => {
+                                  const isChecked = explorerSelectedCols.includes(c.name)
+                                  return (
+                                    <label
+                                      key={c.name}
+                                      className={`explorer-col-chip ${isChecked ? 'checked' : ''}`}
+                                    >
+                                      <input
+                                        type="checkbox"
+                                        checked={isChecked}
+                                        onChange={() => handleExplorerToggleCol(c.name)}
+                                      />
+                                      <span>{c.name}</span>
+                                      {c.primary_key && <span className="pill primary" style={{ fontSize: 8, padding: '1px 4px' }}>PK</span>}
+                                    </label>
+                                  )
+                                })}
+                              </div>
+                            </div>
+
+                            <div className="crud-action-bar" style={{ marginBottom: 12, justifyContent: 'space-between' }}>
+                              <button className="button small primary" onClick={() => setShowAddColumn(true)}>
+                                <Plus size={12} /> Add Column
+                              </button>
+                              <span style={{ fontSize: 11, color: 'var(--text-tertiary)' }}>
+                                {detail.columns.filter(c => explorerSelectedCols.includes(c.name)).length} of {detail.columns.length} columns displayed in <code>{detail.table}</code>
+                              </span>
+                            </div>
+
+                            {detail.columns.filter(c => explorerSelectedCols.includes(c.name)).length === 0 ? (
+                              <div className="filter-empty-state" style={{ padding: 32 }}>
+                                <Columns size={24} style={{ color: 'var(--text-muted)', marginBottom: 8 }} />
+                                <div>All columns are unchecked.</div>
+                                <div style={{ fontSize: 11, marginTop: 4, color: 'var(--text-muted)' }}>
+                                  Check columns in the toolbar above or click <strong>"Select All"</strong> to view column metadata.
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="data-table-wrap">
+                                <table>
+                                  <thead>
+                                    <tr>
+                                      <th>Column</th>
+                                      <th>Data Type</th>
+                                      <th>Nullable</th>
+                                      <th>Properties</th>
+                                      <th style={{ textAlign: 'right' }}>Actions</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {detail.columns
+                                      .filter(c => explorerSelectedCols.includes(c.name))
+                                      .map(c => (
+                                        <tr key={c.name}>
+                                          <td>
+                                            <strong>{c.name}</strong>
+                                            <small>#{c.ordinal_position}</small>
+                                          </td>
+                                          <td>
+                                            <code>{c.data_type}</code>
+                                          </td>
+                                          <td>
+                                            <span className={c.nullable ? 'pill neutral' : 'pill required'}>
+                                              {c.nullable ? 'YES' : 'NO'}
+                                            </span>
+                                          </td>
+                                          <td>
+                                            <div className="tag-list">
+                                              {c.primary_key && <span className="pill primary">PK</span>}
+                                              {c.foreign_key && <span className="pill foreign">FK</span>}
+                                              {c.unique && <span className="pill unique">UNIQUE</span>}
+                                              {c.default !== null && <span className="pill neutral">DEFAULT</span>}
+                                            </div>
+                                          </td>
+                                          <td style={{ textAlign: 'right' }}>
+                                            <div className="crud-inline-actions" style={{ justifyContent: 'flex-end' }}>
+                                              <button
+                                                className="button small secondary"
+                                                onClick={() => setShowRenameColumn(c)}
+                                                title="Rename column"
+                                              >
+                                                <Edit size={11} />
+                                              </button>
+                                              <button
+                                                className="button small secondary"
+                                                onClick={() => setShowEditColumn(c)}
+                                                title="Modify column attributes"
+                                              >
+                                                <Settings size={11} />
+                                              </button>
+                                              <button
+                                                className="button small secondary danger-button"
+                                                onClick={() => setShowDeleteColumnConfirm(c)}
+                                                title="Delete column"
+                                                disabled={c.primary_key}
+                                              >
+                                                <Trash2 size={11} />
+                                              </button>
+                                            </div>
+                                          </td>
+                                        </tr>
+                                      ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+                          </>
                         )}
                         {tab === 'Keys' && (
                           <div className="metadata-sections">
@@ -2420,34 +2829,185 @@ function App() {
                         )}
                         {tab === 'Data' && (
                           <>
-                            <div className="data-note">
-                              Read-only preview · {rows?.rows.length ?? 0} rows on this page
+                            {/* Feature 1 & 2: Dynamic Column Selection Toolbar */}
+                            <div className="explorer-column-toolbar">
+                              <div className="explorer-column-toolbar-top">
+                                <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                  <span style={{ fontSize: 12, fontWeight: 700, color: 'var(--text-primary)' }}>
+                                    Display Columns:
+                                  </span>
+                                  <span className="count-pill" style={{ fontSize: 10 }}>
+                                    {explorerSelectedCols.length} / {detail.columns.length} Checked
+                                  </span>
+                                </div>
+                                <div style={{ display: 'flex', gap: 6 }}>
+                                  <button
+                                    type="button"
+                                    className="button small secondary"
+                                    onClick={handleExplorerSelectAll}
+                                  >
+                                    Select All
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="button small secondary"
+                                    onClick={handleExplorerClearAll}
+                                    disabled={explorerSelectedCols.length === 0}
+                                  >
+                                    Clear All
+                                  </button>
+                                </div>
+                              </div>
+
+                              <div className="explorer-column-checkboxes">
+                                {detail.columns.map(c => {
+                                  const isChecked = explorerSelectedCols.includes(c.name)
+                                  return (
+                                    <label
+                                      key={c.name}
+                                      className={`explorer-col-chip ${isChecked ? 'checked' : ''}`}
+                                    >
+                                      <input
+                                        type="checkbox"
+                                        checked={isChecked}
+                                        onChange={() => handleExplorerToggleCol(c.name)}
+                                      />
+                                      <span>{c.name}</span>
+                                      {c.primary_key && <span className="pill primary" style={{ fontSize: 8, padding: '1px 4px' }}>PK</span>}
+                                    </label>
+                                  )
+                                })}
+                              </div>
                             </div>
-                            <div className="data-table-wrap">
-                              <table>
-                                <thead>
-                                  <tr>
-                                    {(rows?.columns || []).map(c => (
-                                      <th key={c}>{c}</th>
-                                    ))}
-                                  </tr>
-                                </thead>
-                                <tbody>
-                                  {(rows?.rows || []).map((r, i) => (
-                                    <tr key={i}>
-                                      {(rows?.columns || []).map(c => (
-                                        <td key={c}>{r[c] === null ? <em>NULL</em> : String(r[c] ?? '')}</td>
-                                      ))}
-                                    </tr>
-                                  ))}
-                                  {rows?.rows.length === 0 && (
+
+                            {/* Data Controls & Actions Bar */}
+                            <div className="data-tab-controls">
+                              <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                                <button
+                                  className="button small primary"
+                                  onClick={() => setShowAddRow(true)}
+                                >
+                                  <Plus size={12} /> Add Row
+                                </button>
+                                <span className="data-note" style={{ margin: 0 }}>
+                                  Showing {rows?.rows.length ?? 0} rows · {explorerSelectedCols.length} selected column(s)
+                                </span>
+                              </div>
+
+                              <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                                <button
+                                  className="button small secondary"
+                                  onClick={() => exportToExcelCSV(detail.table, explorerSelectedCols, rows?.rows || [])}
+                                  disabled={!rows || rows.rows.length === 0 || explorerSelectedCols.length === 0}
+                                  title="Export currently selected columns to CSV / Excel"
+                                >
+                                  <FileSpreadsheet size={12} /> Excel CSV
+                                </button>
+                                <button
+                                  className="button small secondary"
+                                  onClick={() => exportToExcelXLS(detail.table, explorerSelectedCols, rows?.rows || [])}
+                                  disabled={!rows || rows.rows.length === 0 || explorerSelectedCols.length === 0}
+                                  title="Export currently selected columns to Excel XLS"
+                                >
+                                  <Download size={12} /> Excel XLS
+                                </button>
+                              </div>
+                            </div>
+
+                            {/* Data Table */}
+                            {explorerSelectedCols.length === 0 ? (
+                              <div className="filter-empty-state" style={{ padding: 32 }}>
+                                <Columns size={24} style={{ color: 'var(--text-muted)', marginBottom: 8 }} />
+                                <div>All columns are unchecked.</div>
+                                <div style={{ fontSize: 11, marginTop: 4, color: 'var(--text-muted)' }}>
+                                  Check columns in the toolbar above or click <strong>"Select All"</strong> to preview data records.
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="data-table-wrap">
+                                <table>
+                                  <thead>
                                     <tr>
-                                      <td colSpan={rows?.columns.length || 1}>No records found.</td>
+                                      {Boolean(detail.primary_key?.constrained_columns?.length) && (
+                                        <th style={{ width: 85, textAlign: 'center' }}>Actions</th>
+                                      )}
+                                      {detail.columns
+                                        .filter(c => explorerSelectedCols.includes(c.name))
+                                        .map(c => (
+                                          <th key={c.name}>
+                                            <span style={{ fontFamily: 'var(--font-mono)' }}>{c.name}</span>
+                                            {c.primary_key && <span className="pill primary" style={{ fontSize: 8, marginLeft: 4 }}>PK</span>}
+                                          </th>
+                                        ))}
                                     </tr>
-                                  )}
-                                </tbody>
-                              </table>
-                            </div>
+                                  </thead>
+                                  <tbody>
+                                    {(rows?.rows || []).map((r, i) => {
+                                      const hasPk = Boolean(detail.primary_key?.constrained_columns?.length)
+                                      const visibleCols = detail.columns
+                                        .filter(c => explorerSelectedCols.includes(c.name))
+                                        .map(c => c.name)
+                                      return (
+                                        <tr key={i}>
+                                          {hasPk && (
+                                            <td style={{ textAlign: 'center' }}>
+                                              <div className="crud-inline-actions" style={{ justifyContent: 'center' }}>
+                                                <button
+                                                  className="button small secondary"
+                                                  onClick={() => setShowEditRow(r)}
+                                                  title="Edit this record"
+                                                  style={{ padding: '3px 6px' }}
+                                                >
+                                                  <Edit size={11} />
+                                                </button>
+                                                <button
+                                                  className="button small secondary danger-button"
+                                                  onClick={() => setShowDeleteRowConfirm(r)}
+                                                  title="Delete this record"
+                                                  style={{ padding: '3px 6px' }}
+                                                >
+                                                  <Trash2 size={11} />
+                                                </button>
+                                              </div>
+                                            </td>
+                                          )}
+                                          {visibleCols.map(col => {
+                                            const val = r[col]
+                                            return (
+                                              <td key={col}>
+                                                {val === null || val === undefined ? (
+                                                  <em style={{ color: 'var(--text-muted)' }}>NULL</em>
+                                                ) : typeof val === 'boolean' ? (
+                                                  <span className={val ? 'pill primary' : 'pill neutral'}>
+                                                    {val ? 'TRUE' : 'FALSE'}
+                                                  </span>
+                                                ) : (
+                                                  String(val)
+                                                )}
+                                              </td>
+                                            )
+                                          })}
+                                        </tr>
+                                      )
+                                    })}
+                                    {rows?.rows.length === 0 && (
+                                      <tr>
+                                        <td
+                                          colSpan={
+                                            (detail.columns.filter(c => explorerSelectedCols.includes(c.name)).length || 1) +
+                                            (detail.primary_key?.constrained_columns?.length ? 1 : 0)
+                                          }
+                                          style={{ textAlign: 'center', padding: 24, color: 'var(--text-muted)' }}
+                                        >
+                                          No records found in table "{detail.table}".
+                                        </td>
+                                      </tr>
+                                    )}
+                                  </tbody>
+                                </table>
+                              </div>
+                            )}
+
                             <div className="pagination">
                               <button disabled={offset === 0} onClick={() => void changePage(Math.max(0, offset - 25))}>
                                 Previous
@@ -2469,10 +3029,10 @@ function App() {
 
               <footer className="footer">
                 <span>
-                  SchemaPilot <span className="muted">· Database Metadata Intelligence</span>
+                  SchemaPilot <span className="muted">· Database Management Platform</span>
                 </span>
                 <span>
-                  <CheckCircle2 size={13} /> Read-only mode enabled
+                  <CheckCircle2 size={13} /> Full CRUD Database Operations Active
                 </span>
               </footer>
             </div>
@@ -2724,6 +3284,137 @@ function App() {
           </div>
         </div>
       )}
+
+      {/* ─── Feature 3, 4, 5: Visual CRUD Modals ─── */}
+      {showCreateTable && (
+        <CreateTableModal
+          apiUrl={apiUrl}
+          schema={schema}
+          onSuccess={newTable => void handleCrudSuccess(newTable)}
+          onClose={() => setShowCreateTable(false)}
+        />
+      )}
+
+      {showRenameTable && selected && (
+        <RenameTableModal
+          apiUrl={apiUrl}
+          schema={schema}
+          tableName={selected}
+          onSuccess={newName => void handleCrudSuccess(newName)}
+          onClose={() => setShowRenameTable(false)}
+        />
+      )}
+
+      {showViewStructure && selected && (
+        <ViewTableStructureModal
+          apiUrl={apiUrl}
+          schema={schema}
+          tableName={selected}
+          onClose={() => setShowViewStructure(false)}
+        />
+      )}
+
+      {showDeleteTableConfirm && selected && (
+        <ConfirmDialog
+          title="Delete Table"
+          message={`Are you sure you want to permanently delete table "${selected}" and all its records? This cannot be undone.`}
+          confirmText="Delete Table"
+          destructive
+          loading={crudLoading}
+          onConfirm={() => void handleDeleteTable()}
+          onCancel={() => setShowDeleteTableConfirm(false)}
+        />
+      )}
+
+      {showAddColumn && selected && (
+        <AddColumnModal
+          apiUrl={apiUrl}
+          schema={schema}
+          tableName={selected}
+          onSuccess={() => void handleCrudSuccess()}
+          onClose={() => setShowAddColumn(false)}
+        />
+      )}
+
+      {showEditColumn && selected && (
+        <EditColumnModal
+          apiUrl={apiUrl}
+          schema={schema}
+          tableName={selected}
+          column={showEditColumn}
+          onSuccess={() => void handleCrudSuccess()}
+          onClose={() => setShowEditColumn(null)}
+        />
+      )}
+
+      {showRenameColumn && selected && (
+        <RenameColumnModal
+          apiUrl={apiUrl}
+          schema={schema}
+          tableName={selected}
+          column={showRenameColumn}
+          onSuccess={() => void handleCrudSuccess()}
+          onClose={() => setShowRenameColumn(null)}
+        />
+      )}
+
+      {showDeleteColumnConfirm && selected && (
+        <ConfirmDialog
+          title="Delete Column"
+          message={`Are you sure you want to delete column "${showDeleteColumnConfirm.name}" from table "${selected}"? Data in this column will be permanently removed.`}
+          confirmText="Delete Column"
+          destructive
+          loading={crudLoading}
+          onConfirm={() => void handleDeleteColumn(showDeleteColumnConfirm.name)}
+          onCancel={() => setShowDeleteColumnConfirm(null)}
+        />
+      )}
+
+      {showAddRow && selected && detail && (
+        <AddRowModal
+          apiUrl={apiUrl}
+          schema={schema}
+          tableName={selected}
+          columns={detail.columns}
+          onSuccess={() => void handleCrudSuccess()}
+          onClose={() => setShowAddRow(false)}
+        />
+      )}
+
+      {showEditRow && selected && detail && (
+        <EditRowModal
+          apiUrl={apiUrl}
+          schema={schema}
+          tableName={selected}
+          columns={detail.columns}
+          row={showEditRow}
+          primaryKey={detail.primary_key}
+          onSuccess={() => void handleCrudSuccess()}
+          onClose={() => setShowEditRow(null)}
+        />
+      )}
+
+      {showDeleteRowConfirm && selected && (
+        <ConfirmDialog
+          title="Delete Record"
+          message="Are you sure you want to delete this record from the database? This action cannot be undone."
+          confirmText="Delete Record"
+          destructive
+          loading={crudLoading}
+          onConfirm={() => void handleDeleteRow(showDeleteRowConfirm)}
+          onCancel={() => setShowDeleteRowConfirm(null)}
+        />
+      )}
+
+      {crudError && (
+        <ConfirmDialog
+          title="Operation Failed"
+          message={crudError}
+          confirmText="Dismiss"
+          onConfirm={() => setCrudError('')}
+          onCancel={() => setCrudError('')}
+        />
+      )}
     </div>
   )
 }
@@ -2742,7 +3433,7 @@ function Metric({ icon, label, value, tone }: { icon: React.ReactNode; label: st
   )
 }
 
-function MiniStat({ label, value }: { label: string; value: number }) {
+function MiniStat({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="mini-stat">
       <span>{label}</span>

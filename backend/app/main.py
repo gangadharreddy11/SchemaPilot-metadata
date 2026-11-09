@@ -815,3 +815,913 @@ def delete_saved_selection(selection_id: str) -> dict[str, Any]:
     save_saved_selections_to_disk(filtered_items)
     return {"ok": True, "message": f"Selection '{selection_id}' removed."}
 
+
+
+# ---------------------------------------------------------------------------
+# NEW ENDPOINTS – Features 2-5 (appended, do not modify lines 1-817 above)
+# ---------------------------------------------------------------------------
+import re
+from typing import Optional
+
+from sqlalchemy.sql import quoted_name
+
+
+# ── Identifier validation helper ──────────────────────────────────────────
+
+def _valid_identifier(name: str) -> bool:
+    """Return True if *name* is a safe SQL identifier."""
+    return bool(re.match(r'^[A-Za-z_][A-Za-z0-9_]*$', name))
+
+
+def _require_valid_identifier(name: str, label: str = "identifier") -> None:
+    if not _valid_identifier(name):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid {label}: '{name}'. Must start with a letter or underscore and contain only alphanumerics/underscores.",
+        )
+
+
+# ── Column Preferences file helpers ──────────────────────────────────────
+
+COLUMN_PREFERENCES_FILE = BACKEND_DIR / "column_preferences.json"
+
+
+def _load_column_preferences() -> dict:
+    if COLUMN_PREFERENCES_FILE.is_file():
+        try:
+            return json.loads(COLUMN_PREFERENCES_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_column_preferences(data: dict) -> None:
+    COLUMN_PREFERENCES_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def _pref_key(table: str, schema: str) -> str:
+    return f"{schema}.{table}"
+
+
+# ── Pydantic models for new endpoints ────────────────────────────────────
+
+class ColumnPreferencePayload(BaseModel):
+    table: str
+    schema_name: str = "public"
+    selected_columns: list[str]
+
+
+class ColumnDefinition(BaseModel):
+    name: str
+    data_type: str
+    primary_key: bool = False
+    nullable: bool = True
+    unique: bool = False
+    default_value: str | None = None
+
+
+class CreateTablePayload(BaseModel):
+    table_name: str
+    schema_name: str = "public"
+    columns: list[ColumnDefinition]
+
+
+class RenameTablePayload(BaseModel):
+    new_name: str
+    schema_name: str = "public"
+
+
+class AddColumnPayload(BaseModel):
+    name: str
+    data_type: str
+    nullable: bool = True
+    unique: bool = False
+    default_value: str | None = None
+    schema_name: str = "public"
+
+
+class RenameColumnPayload(BaseModel):
+    new_name: str
+    schema_name: str = "public"
+
+
+class ModifyColumnPayload(BaseModel):
+    data_type: str | None = None
+    nullable: bool | None = None
+    unique: bool | None = None
+    default_value: str | None = None
+    schema_name: str = "public"
+
+
+class InsertRecordPayload(BaseModel):
+    schema_name: str = "public"
+    record: dict[str, Any]
+
+
+class UpdateRecordPayload(BaseModel):
+    schema_name: str = "public"
+    primary_key: dict[str, Any]
+    updates: dict[str, Any]
+
+
+class DeleteRecordPayload(BaseModel):
+    schema_name: str = "public"
+    primary_key: dict[str, Any]
+
+
+class RecordQueryPayload(BaseModel):
+    schema_name: str | None = None
+    columns: list[str] | None = None
+    filters: list[FilterRule] = []
+    conjunction: str = "AND"
+    sort_column: str | None = None
+    sort_direction: str = "asc"
+    limit: int = 50
+    offset: int = 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Feature 2 – Column Preferences Persistence
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/preferences/columns")
+def get_column_preferences(
+    table: str = Query(...),
+    schema: str = Query(default="public"),
+) -> dict[str, Any]:
+    """Return saved column preferences for a table, plus the full column list.
+
+    The saved record stores both ``selected`` (checked columns) and
+    ``known`` (all columns that existed when the user last saved).
+    Any column present in the live DB but *not* in ``known`` is treated
+    as a **newly added column** and is auto-included as checked.
+    """
+    try:
+        target_schema = resolve_table_schema(table, schema)
+        insp = get_inspector()
+        all_cols = [c["name"] for c in insp.get_columns(table, schema=target_schema)]
+
+        prefs = _load_column_preferences()
+        key = _pref_key(table, target_schema)
+        saved_entry = prefs.get(key)
+
+        if saved_entry is not None:
+            # Support both old format (plain list) and new format (dict with selected+known)
+            if isinstance(saved_entry, dict):
+                saved_selected = saved_entry.get("selected", [])
+                saved_known = saved_entry.get("known", [])
+            else:
+                # Legacy: bare list – treat all as both selected and known
+                saved_selected = saved_entry if isinstance(saved_entry, list) else []
+                saved_known = saved_selected
+
+            # Keep only columns that still exist in DB
+            selected = [c for c in saved_selected if c in all_cols]
+            # Auto-include newly discovered columns (not in known snapshot)
+            new_cols = [c for c in all_cols if c not in saved_known]
+            selected = selected + new_cols
+        else:
+            # No preferences saved yet – default to all columns checked
+            selected = list(all_cols)
+
+        return {
+            "table": table,
+            "schema": target_schema,
+            "selected_columns": selected,
+            "all_columns": all_cols,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=sanitize_error(exc))
+
+
+@app.put("/api/preferences/columns")
+@app.post("/api/preferences/columns")
+def save_column_preferences(payload: ColumnPreferencePayload) -> dict[str, Any]:
+    """Persist selected-column preferences for a table.
+
+    Stores both the user's ``selected`` columns and the full ``known``
+    column list so that future GET requests can detect newly added columns.
+    """
+    try:
+        target_schema = resolve_table_schema(payload.table, payload.schema_name)
+        insp = get_inspector()
+        all_cols = [c["name"] for c in insp.get_columns(payload.table, schema=target_schema)]
+
+        # Validate each requested column actually exists
+        invalid = [c for c in payload.selected_columns if c not in all_cols]
+        if invalid:
+            raise HTTPException(status_code=400, detail=f"Unknown columns: {invalid}")
+
+        prefs = _load_column_preferences()
+        key = _pref_key(payload.table, target_schema)
+        # Store both selected and known columns
+        prefs[key] = {
+            "selected": payload.selected_columns,
+            "known": all_cols,
+        }
+        _save_column_preferences(prefs)
+
+        return {"ok": True, "table": payload.table, "schema": target_schema, "selected_columns": payload.selected_columns}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=sanitize_error(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Feature 3 – Table-Level CRUD
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SQL_TYPE_MAP = {
+    "integer": "INTEGER",
+    "int": "INTEGER",
+    "bigint": "BIGINT",
+    "smallint": "SMALLINT",
+    "serial": "SERIAL",
+    "bigserial": "BIGSERIAL",
+    "text": "TEXT",
+    "varchar": "VARCHAR(255)",
+    "char": "CHAR(1)",
+    "boolean": "BOOLEAN",
+    "bool": "BOOLEAN",
+    "float": "FLOAT",
+    "double": "DOUBLE PRECISION",
+    "numeric": "NUMERIC",
+    "decimal": "DECIMAL",
+    "date": "DATE",
+    "timestamp": "TIMESTAMP",
+    "timestamptz": "TIMESTAMP WITH TIME ZONE",
+    "time": "TIME",
+    "json": "JSON",
+    "jsonb": "JSONB",
+    "uuid": "UUID",
+    "bytea": "BYTEA",
+    "blob": "BLOB",
+    "real": "REAL",
+}
+
+
+def _resolve_sql_type(raw: str) -> str:
+    """Map a user-provided type string to a safe SQL type token."""
+    key = raw.strip().lower()
+    if key in _SQL_TYPE_MAP:
+        return _SQL_TYPE_MAP[key]
+    # Allow e.g. "varchar(100)", "numeric(10,2)" — validate pattern
+    if re.match(r'^[a-z][a-z0-9_ ]*(\(\d+(,\s*\d+)?\))?$', key):
+        return raw.strip().upper()
+    raise HTTPException(status_code=400, detail=f"Unsupported data type: '{raw}'")
+
+
+@app.post("/api/tables/create")
+def create_table(payload: CreateTablePayload) -> dict[str, Any]:
+    """Create a new table with specified columns via DDL."""
+    _require_valid_identifier(payload.table_name, "table name")
+    if not payload.columns:
+        raise HTTPException(status_code=400, detail="At least one column is required.")
+
+    target_schema = resolve_schema(payload.schema_name)
+
+    # Check table doesn't already exist
+    insp = get_inspector()
+    existing = insp.get_table_names(schema=target_schema)
+    if payload.table_name in existing:
+        raise HTTPException(status_code=409, detail=f"Table '{payload.table_name}' already exists in schema '{target_schema}'.")
+
+    col_defs: list[str] = []
+    pk_cols: list[str] = []
+    for col in payload.columns:
+        _require_valid_identifier(col.name, "column name")
+        sql_type = _resolve_sql_type(col.data_type)
+        parts = [str(quoted_name(col.name, quote=True)), sql_type]
+        if not col.nullable:
+            parts.append("NOT NULL")
+        if col.unique:
+            parts.append("UNIQUE")
+        if col.default_value is not None:
+            # Only allow simple literal defaults
+            dv = col.default_value.strip()
+            if not re.match(r"^[A-Za-z0-9_'(). +\-]+$", dv):
+                raise HTTPException(status_code=400, detail=f"Invalid default value: '{dv}'")
+            parts.append(f"DEFAULT {dv}")
+        if col.primary_key:
+            pk_cols.append(str(quoted_name(col.name, quote=True)))
+        col_defs.append(" ".join(parts))
+
+    if pk_cols:
+        col_defs.append(f"PRIMARY KEY ({', '.join(pk_cols)})")
+
+    schema_prefix = f"{quoted_name(target_schema, quote=True)}." if target_schema else ""
+    ddl = f"CREATE TABLE {schema_prefix}{quoted_name(payload.table_name, quote=True)} (\n  {','.join(col_defs)}\n)"
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+        return {"ok": True, "table": payload.table_name, "schema": target_schema}
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to create table: {sanitize_error(exc)}")
+
+
+@app.put("/api/tables/{table_name}/rename")
+def rename_table(table_name: str, payload: RenameTablePayload) -> dict[str, Any]:
+    """Rename an existing table via ALTER TABLE … RENAME TO."""
+    _require_valid_identifier(payload.new_name, "new table name")
+    target_schema = resolve_table_schema(table_name, payload.schema_name)
+
+    # Ensure new name doesn't collide
+    insp = get_inspector()
+    existing = insp.get_table_names(schema=target_schema)
+    if payload.new_name in existing:
+        raise HTTPException(status_code=409, detail=f"Table '{payload.new_name}' already exists.")
+
+    schema_prefix = f"{quoted_name(target_schema, quote=True)}." if target_schema else ""
+    old_q = f"{schema_prefix}{quoted_name(table_name, quote=True)}"
+    new_q = str(quoted_name(payload.new_name, quote=True))
+
+    dialect = engine.dialect.name
+    if dialect == "mysql":
+        ddl = f"ALTER TABLE {old_q} RENAME TO {new_q}"
+    else:
+        ddl = f"ALTER TABLE {old_q} RENAME TO {new_q}"
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+        return {"ok": True, "old_name": table_name, "new_name": payload.new_name, "schema": target_schema}
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to rename table: {sanitize_error(exc)}")
+
+
+@app.delete("/api/tables/{table_name}")
+def drop_table(
+    table_name: str,
+    schema: str = Query(default="public"),
+) -> dict[str, Any]:
+    """Drop a table. Checks for foreign-key dependents first."""
+    target_schema = resolve_table_schema(table_name, schema)
+    insp = get_inspector()
+
+    # Check for FK references from other tables
+    all_tables = insp.get_table_names(schema=target_schema)
+    dependents: list[str] = []
+    for t in all_tables:
+        if t == table_name:
+            continue
+        try:
+            fks = insp.get_foreign_keys(t, schema=target_schema)
+            for fk in fks:
+                if fk.get("referred_table") == table_name:
+                    dependents.append(t)
+                    break
+        except Exception:
+            continue
+
+    if dependents:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot drop '{table_name}': referenced by foreign keys in table(s): {dependents}. Drop those constraints first.",
+        )
+
+    schema_prefix = f"{quoted_name(target_schema, quote=True)}." if target_schema else ""
+    ddl = f"DROP TABLE {schema_prefix}{quoted_name(table_name, quote=True)}"
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+        return {"ok": True, "dropped": table_name, "schema": target_schema}
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to drop table: {sanitize_error(exc)}")
+
+
+@app.get("/api/tables/{table_name}/structure")
+def table_structure(
+    table_name: str,
+    schema: str = Query(default="public"),
+) -> dict[str, Any]:
+    """Return full structural info for a table (columns, PKs, FKs, indexes, constraints)."""
+    try:
+        target_schema = resolve_table_schema(table_name, schema)
+        insp = get_inspector()
+
+        columns = insp.get_columns(table_name, schema=target_schema)
+        pk = insp.get_pk_constraint(table_name, schema=target_schema)
+        fks = insp.get_foreign_keys(table_name, schema=target_schema)
+        indexes = insp.get_indexes(table_name, schema=target_schema)
+        uniques = safe_get_unique_constraints(insp, table_name, target_schema)
+        checks = safe_get_check_constraints(insp, table_name, target_schema)
+
+        pk_cols = pk.get("constrained_columns", []) if pk else []
+
+        col_info = []
+        for c in columns:
+            col_info.append({
+                "name": c["name"],
+                "type": str(c["type"]),
+                "nullable": c.get("nullable", True),
+                "default": str(c["default"]) if c.get("default") is not None else None,
+                "primary_key": c["name"] in pk_cols,
+            })
+
+        return {
+            "table": table_name,
+            "schema": target_schema,
+            "columns": col_info,
+            "primary_key": pk,
+            "foreign_keys": fks,
+            "indexes": indexes,
+            "unique_constraints": uniques,
+            "check_constraints": checks,
+        }
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=sanitize_error(exc))
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Feature 4 – Column-Level CRUD
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.post("/api/tables/{table_name}/columns")
+def add_column(table_name: str, payload: AddColumnPayload) -> dict[str, Any]:
+    """Add a column to an existing table via ALTER TABLE … ADD COLUMN."""
+    _require_valid_identifier(payload.name, "column name")
+    target_schema = resolve_table_schema(table_name, payload.schema_name)
+
+    # Ensure column doesn't already exist
+    insp = get_inspector()
+    existing_cols = [c["name"] for c in insp.get_columns(table_name, schema=target_schema)]
+    if payload.name in existing_cols:
+        raise HTTPException(status_code=409, detail=f"Column '{payload.name}' already exists in table '{table_name}'.")
+
+    sql_type = _resolve_sql_type(payload.data_type)
+    parts = [f"ALTER TABLE {quoted_name(target_schema, quote=True)}.{quoted_name(table_name, quote=True)}"]
+    parts.append(f"ADD COLUMN {quoted_name(payload.name, quote=True)} {sql_type}")
+    if not payload.nullable:
+        parts.append("NOT NULL")
+    if payload.unique:
+        parts.append("UNIQUE")
+    if payload.default_value is not None:
+        dv = payload.default_value.strip()
+        if not re.match(r"^[A-Za-z0-9_'(). +\-]+$", dv):
+            raise HTTPException(status_code=400, detail=f"Invalid default value: '{dv}'")
+        parts.append(f"DEFAULT {dv}")
+
+    ddl = " ".join(parts)
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+        return {"ok": True, "table": table_name, "column": payload.name, "schema": target_schema}
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to add column: {sanitize_error(exc)}")
+
+
+@app.put("/api/tables/{table_name}/columns/{column_name}/rename")
+def rename_column(
+    table_name: str,
+    column_name: str,
+    payload: RenameColumnPayload,
+) -> dict[str, Any]:
+    """Rename a column via ALTER TABLE … RENAME COLUMN."""
+    _require_valid_identifier(payload.new_name, "new column name")
+    target_schema = resolve_table_schema(table_name, payload.schema_name)
+
+    # Verify column exists
+    insp = get_inspector()
+    existing_cols = [c["name"] for c in insp.get_columns(table_name, schema=target_schema)]
+    if column_name not in existing_cols:
+        raise HTTPException(status_code=404, detail=f"Column '{column_name}' not found in table '{table_name}'.")
+    if payload.new_name in existing_cols:
+        raise HTTPException(status_code=409, detail=f"Column '{payload.new_name}' already exists in table '{table_name}'.")
+
+    schema_prefix = f"{quoted_name(target_schema, quote=True)}."
+    table_q = f"{schema_prefix}{quoted_name(table_name, quote=True)}"
+
+    dialect = engine.dialect.name
+    if dialect == "mysql":
+        # MySQL uses ALTER TABLE t CHANGE old_name new_name <type>
+        col_meta = next(c for c in insp.get_columns(table_name, schema=target_schema) if c["name"] == column_name)
+        col_type = str(col_meta["type"])
+        ddl = f"ALTER TABLE {table_q} CHANGE {quoted_name(column_name, quote=True)} {quoted_name(payload.new_name, quote=True)} {col_type}"
+    else:
+        ddl = f"ALTER TABLE {table_q} RENAME COLUMN {quoted_name(column_name, quote=True)} TO {quoted_name(payload.new_name, quote=True)}"
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+        return {"ok": True, "table": table_name, "old_name": column_name, "new_name": payload.new_name, "schema": target_schema}
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to rename column: {sanitize_error(exc)}")
+
+
+@app.put("/api/tables/{table_name}/columns/{column_name}/modify")
+def modify_column(
+    table_name: str,
+    column_name: str,
+    payload: ModifyColumnPayload,
+) -> dict[str, Any]:
+    """Modify column attributes (type, nullable, unique, default) via ALTER TABLE statements."""
+    target_schema = resolve_table_schema(table_name, payload.schema_name)
+
+    insp = get_inspector()
+    existing_cols = {c["name"]: c for c in insp.get_columns(table_name, schema=target_schema)}
+    if column_name not in existing_cols:
+        raise HTTPException(status_code=404, detail=f"Column '{column_name}' not found in table '{table_name}'.")
+
+    schema_prefix = f"{quoted_name(target_schema, quote=True)}."
+    table_q = f"{schema_prefix}{quoted_name(table_name, quote=True)}"
+    col_q = str(quoted_name(column_name, quote=True))
+    dialect = engine.dialect.name
+    statements: list[str] = []
+
+    if payload.data_type is not None:
+        sql_type = _resolve_sql_type(payload.data_type)
+        if dialect in ("postgresql",):
+            statements.append(f"ALTER TABLE {table_q} ALTER COLUMN {col_q} TYPE {sql_type}")
+        elif dialect == "mysql":
+            nullable = payload.nullable if payload.nullable is not None else existing_cols[column_name].get("nullable", True)
+            null_str = "" if nullable else " NOT NULL"
+            statements.append(f"ALTER TABLE {table_q} MODIFY COLUMN {col_q} {sql_type}{null_str}")
+        else:
+            statements.append(f"ALTER TABLE {table_q} ALTER COLUMN {col_q} TYPE {sql_type}")
+
+    if payload.nullable is not None and payload.data_type is None:
+        if dialect in ("postgresql",):
+            action = "DROP NOT NULL" if payload.nullable else "SET NOT NULL"
+            statements.append(f"ALTER TABLE {table_q} ALTER COLUMN {col_q} {action}")
+        elif dialect == "mysql":
+            col_type = str(existing_cols[column_name]["type"])
+            null_str = "" if payload.nullable else " NOT NULL"
+            statements.append(f"ALTER TABLE {table_q} MODIFY COLUMN {col_q} {col_type}{null_str}")
+
+    if payload.default_value is not None:
+        dv = payload.default_value.strip()
+        if dv == "":
+            statements.append(f"ALTER TABLE {table_q} ALTER COLUMN {col_q} DROP DEFAULT")
+        else:
+            if not re.match(r"^[A-Za-z0-9_'(). +\-]+$", dv):
+                raise HTTPException(status_code=400, detail=f"Invalid default value: '{dv}'")
+            statements.append(f"ALTER TABLE {table_q} ALTER COLUMN {col_q} SET DEFAULT {dv}")
+
+    if payload.unique is not None:
+        if payload.unique:
+            constraint_name = f"uq_{table_name}_{column_name}"
+            if dialect == "mysql":
+                statements.append(f"ALTER TABLE {table_q} ADD UNIQUE ({col_q})")
+            else:
+                statements.append(f"ALTER TABLE {table_q} ADD CONSTRAINT {quoted_name(constraint_name, quote=True)} UNIQUE ({col_q})")
+        else:
+            # Attempt to drop a unique constraint – find the constraint name
+            try:
+                uniques = safe_get_unique_constraints(insp, table_name, target_schema)
+                for uc in uniques:
+                    if column_name in uc.get("column_names", []):
+                        cname = uc.get("name")
+                        if cname:
+                            if dialect == "mysql":
+                                statements.append(f"ALTER TABLE {table_q} DROP INDEX {quoted_name(cname, quote=True)}")
+                            else:
+                                statements.append(f"ALTER TABLE {table_q} DROP CONSTRAINT {quoted_name(cname, quote=True)}")
+                            break
+            except Exception:
+                pass
+
+    if not statements:
+        raise HTTPException(status_code=400, detail="No modifications specified.")
+
+    try:
+        with engine.begin() as conn:
+            for stmt_str in statements:
+                conn.execute(text(stmt_str))
+        return {"ok": True, "table": table_name, "column": column_name, "schema": target_schema, "applied": len(statements)}
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to modify column: {sanitize_error(exc)}")
+
+
+@app.delete("/api/tables/{table_name}/columns/{column_name}")
+def drop_column(
+    table_name: str,
+    column_name: str,
+    schema: str = Query(default="public"),
+) -> dict[str, Any]:
+    """Drop a column from a table via ALTER TABLE … DROP COLUMN."""
+    target_schema = resolve_table_schema(table_name, schema)
+
+    insp = get_inspector()
+    existing_cols = [c["name"] for c in insp.get_columns(table_name, schema=target_schema)]
+    if column_name not in existing_cols:
+        raise HTTPException(status_code=404, detail=f"Column '{column_name}' not found in table '{table_name}'.")
+
+    schema_prefix = f"{quoted_name(target_schema, quote=True)}."
+    table_q = f"{schema_prefix}{quoted_name(table_name, quote=True)}"
+    ddl = f"ALTER TABLE {table_q} DROP COLUMN {quoted_name(column_name, quote=True)}"
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(ddl))
+        return {"ok": True, "table": table_name, "column": column_name, "schema": target_schema}
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to drop column: {sanitize_error(exc)}")
+
+
+@app.get("/api/tables/{table_name}/columns/{column_name}/dependencies")
+def column_dependencies(
+    table_name: str,
+    column_name: str,
+    schema: str = Query(default="public"),
+) -> dict[str, Any]:
+    """Check if a column has foreign-key or index dependencies."""
+    target_schema = resolve_table_schema(table_name, schema)
+    insp = get_inspector()
+
+    # Verify column exists
+    existing_cols = [c["name"] for c in insp.get_columns(table_name, schema=target_schema)]
+    if column_name not in existing_cols:
+        raise HTTPException(status_code=404, detail=f"Column '{column_name}' not found in table '{table_name}'.")
+
+    fk_deps: list[dict] = []
+    index_deps: list[dict] = []
+
+    # Foreign keys on this table referencing the column
+    try:
+        fks = insp.get_foreign_keys(table_name, schema=target_schema)
+        for fk in fks:
+            if column_name in fk.get("constrained_columns", []):
+                fk_deps.append(fk)
+    except Exception:
+        pass
+
+    # Foreign keys from OTHER tables referencing this column
+    try:
+        all_tables = insp.get_table_names(schema=target_schema)
+        for t in all_tables:
+            if t == table_name:
+                continue
+            try:
+                fks = insp.get_foreign_keys(t, schema=target_schema)
+                for fk in fks:
+                    if fk.get("referred_table") == table_name and column_name in fk.get("referred_columns", []):
+                        fk_deps.append({"source_table": t, **fk})
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    # Indexes
+    try:
+        indexes = insp.get_indexes(table_name, schema=target_schema)
+        for idx in indexes:
+            if column_name in idx.get("column_names", []):
+                index_deps.append(idx)
+    except Exception:
+        pass
+
+    return {
+        "table": table_name,
+        "column": column_name,
+        "schema": target_schema,
+        "has_dependencies": bool(fk_deps or index_deps),
+        "foreign_keys": fk_deps,
+        "indexes": index_deps,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Feature 5 – Record-Level CRUD
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _get_pk_columns(table_name: str, schema: str) -> list[str]:
+    """Return primary-key column names for the table, or raise 400."""
+    insp = get_inspector()
+    pk = insp.get_pk_constraint(table_name, schema=schema)
+    pk_cols = pk.get("constrained_columns", []) if pk else []
+    if not pk_cols:
+        raise HTTPException(status_code=400, detail=f"Table '{table_name}' has no primary key; record operations require one.")
+    return pk_cols
+
+
+@app.post("/api/tables/{table_name}/records")
+def insert_record(table_name: str, payload: InsertRecordPayload) -> dict[str, Any]:
+    """Insert a single record into a table."""
+    target_schema = resolve_table_schema(table_name, payload.schema_name)
+    metadata = MetaData()
+    table = Table(table_name, metadata, schema=target_schema, autoload_with=engine)
+
+    # Validate column names in the record
+    valid_col_names = {c.name for c in table.columns}
+    invalid = [k for k in payload.record if k not in valid_col_names]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown columns: {invalid}")
+
+    if not payload.record:
+        raise HTTPException(status_code=400, detail="Record data cannot be empty.")
+
+    try:
+        with engine.begin() as conn:
+            conn.execute(table.insert().values(**payload.record))
+        return {"ok": True, "table": table_name, "schema": target_schema, "inserted": payload.record}
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Insert failed: {sanitize_error(exc)}")
+
+
+@app.put("/api/tables/{table_name}/records")
+def update_record(table_name: str, payload: UpdateRecordPayload) -> dict[str, Any]:
+    """Update a single record identified by its primary key."""
+    target_schema = resolve_table_schema(table_name, payload.schema_name)
+    metadata = MetaData()
+    table = Table(table_name, metadata, schema=target_schema, autoload_with=engine)
+
+    pk_cols = _get_pk_columns(table_name, target_schema)
+
+    # Validate PK fields provided
+    missing_pk = [k for k in pk_cols if k not in payload.primary_key]
+    if missing_pk:
+        raise HTTPException(status_code=400, detail=f"Missing primary key columns: {missing_pk}")
+
+    # Validate update column names
+    valid_col_names = {c.name for c in table.columns}
+    invalid = [k for k in payload.updates if k not in valid_col_names]
+    if invalid:
+        raise HTTPException(status_code=400, detail=f"Unknown columns in updates: {invalid}")
+
+    if not payload.updates:
+        raise HTTPException(status_code=400, detail="No updates specified.")
+
+    # Build WHERE from PK
+    conditions = [table.c[k] == payload.primary_key[k] for k in pk_cols]
+
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(table.update().where(and_(*conditions)).values(**payload.updates))
+            if result.rowcount == 0:
+                raise HTTPException(status_code=404, detail="No record found with the given primary key.")
+        return {"ok": True, "table": table_name, "schema": target_schema, "updated": result.rowcount}
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Update failed: {sanitize_error(exc)}")
+
+
+@app.delete("/api/tables/{table_name}/records")
+def delete_record(table_name: str, payload: DeleteRecordPayload) -> dict[str, Any]:
+    """Delete a single record identified by its primary key."""
+    target_schema = resolve_table_schema(table_name, payload.schema_name)
+    metadata = MetaData()
+    table = Table(table_name, metadata, schema=target_schema, autoload_with=engine)
+
+    pk_cols = _get_pk_columns(table_name, target_schema)
+
+    missing_pk = [k for k in pk_cols if k not in payload.primary_key]
+    if missing_pk:
+        raise HTTPException(status_code=400, detail=f"Missing primary key columns: {missing_pk}")
+
+    conditions = [table.c[k] == payload.primary_key[k] for k in pk_cols]
+
+    try:
+        with engine.begin() as conn:
+            result = conn.execute(table.delete().where(and_(*conditions)))
+            if result.rowcount == 0:
+                raise HTTPException(status_code=404, detail="No record found with the given primary key.")
+        return {"ok": True, "table": table_name, "schema": target_schema, "deleted": result.rowcount}
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Delete failed: {sanitize_error(exc)}")
+
+
+@app.post("/api/tables/{table_name}/records/query")
+def query_records(table_name: str, payload: RecordQueryPayload) -> dict[str, Any]:
+    """Enhanced query with sort, filter, pagination, and column selection."""
+    try:
+        target_schema = resolve_table_schema(table_name, payload.schema_name)
+        metadata = MetaData()
+        table = Table(table_name, metadata, schema=target_schema, autoload_with=engine)
+
+        # Resolve columns
+        all_col_names = [c.name for c in table.columns]
+        if payload.columns:
+            valid_cols = [c for c in payload.columns if c in all_col_names]
+        else:
+            valid_cols = all_col_names
+
+        if not valid_cols:
+            valid_cols = all_col_names[:4] or all_col_names
+
+        selected_col_objs = [table.c[col] for col in valid_cols]
+
+        # Build filter conditions (reuse same logic as existing /api/query)
+        conditions = []
+        for f in payload.filters:
+            col_name = f.column.strip()
+            if not col_name or col_name not in table.c:
+                continue
+
+            col_c = table.c[col_name]
+            op = (f.operator or "equals").strip().lower()
+            val = f.value
+
+            type_str = str(col_c.type).upper()
+            is_numeric = any(t in type_str for t in ("INT", "NUMERIC", "DECIMAL", "FLOAT", "DOUBLE", "REAL"))
+            parsed_val = val
+            if is_numeric and val is not None and isinstance(val, str):
+                try:
+                    parsed_val = float(val) if "." in val else int(val)
+                except ValueError:
+                    parsed_val = val
+
+            if op in ("equals", "eq", "="):
+                conditions.append(col_c == parsed_val)
+            elif op in ("not_equals", "neq", "!="):
+                conditions.append(col_c != parsed_val)
+            elif op in ("contains", "like"):
+                conditions.append(cast(col_c, String).ilike(f"%{parsed_val}%"))
+            elif op in ("starts_with", "startswith"):
+                conditions.append(cast(col_c, String).ilike(f"{parsed_val}%"))
+            elif op in ("ends_with", "endswith"):
+                conditions.append(cast(col_c, String).ilike(f"%{parsed_val}"))
+            elif op in ("greater_than", "gt", ">"):
+                conditions.append(col_c > parsed_val)
+            elif op in ("less_than", "lt", "<"):
+                conditions.append(col_c < parsed_val)
+            elif op in ("greater_than_or_equal", "gte", ">="):
+                conditions.append(col_c >= parsed_val)
+            elif op in ("less_than_or_equal", "lte", "<="):
+                conditions.append(col_c <= parsed_val)
+            elif op in ("is_empty", "isempty"):
+                conditions.append(or_(col_c.is_(None), cast(col_c, String) == ""))
+            elif op in ("is_not_empty", "isnotempty"):
+                conditions.append(and_(col_c.is_not(None), cast(col_c, String) != ""))
+            elif op in ("is_null", "isnull"):
+                conditions.append(col_c.is_(None))
+            elif op in ("is_not_null", "isnotnull"):
+                conditions.append(col_c.is_not(None))
+
+        where_clause = None
+        if conditions:
+            if payload.conjunction.strip().upper() == "OR":
+                where_clause = or_(*conditions)
+            else:
+                where_clause = and_(*conditions)
+
+        count_stmt = select(func.count()).select_from(table)
+        if where_clause is not None:
+            count_stmt = count_stmt.where(where_clause)
+
+        stmt = select(*selected_col_objs)
+        if where_clause is not None:
+            stmt = stmt.where(where_clause)
+
+        if payload.sort_column and payload.sort_column in table.c:
+            sort_c = table.c[payload.sort_column]
+            if payload.sort_direction.lower() == "desc":
+                stmt = stmt.order_by(sort_c.desc())
+            else:
+                stmt = stmt.order_by(sort_c.asc())
+
+        clamped_limit = max(1, min(payload.limit, 500))
+        clamped_offset = max(0, payload.offset)
+        stmt = stmt.limit(clamped_limit).offset(clamped_offset)
+
+        with engine.connect() as conn:
+            total_matching = conn.execute(count_stmt).scalar() or 0
+            rows = conn.execute(stmt).mappings().all()
+
+        return {
+            "schema": target_schema,
+            "table": table_name,
+            "columns": valid_cols,
+            "total_matching": total_matching,
+            "limit": clamped_limit,
+            "offset": clamped_offset,
+            "rows": [{k: safe_value(v) for k, v in row.items()} for row in rows],
+        }
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Query failed: {sanitize_error(exc)}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Feature 5 (extra) – Table row count
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.get("/api/tables/{table_name}/count")
+def table_row_count(
+    table_name: str,
+    schema: str = Query(default="public"),
+) -> dict[str, Any]:
+    """Return the row count for a table."""
+    try:
+        target_schema = resolve_table_schema(table_name, schema)
+        metadata = MetaData()
+        table = Table(table_name, metadata, schema=target_schema, autoload_with=engine)
+
+        with engine.connect() as conn:
+            count = conn.execute(select(func.count()).select_from(table)).scalar() or 0
+
+        return {"table": table_name, "schema": target_schema, "count": count}
+    except HTTPException:
+        raise
+    except SQLAlchemyError as exc:
+        raise HTTPException(status_code=502, detail=f"Count query failed: {sanitize_error(exc)}")
